@@ -1,0 +1,1100 @@
+-- MoneyMoney Extension: Umweltbank Depot
+--
+-- Umweltbank's login POST encrypts credentials with JWE (JSON Web Encryption,
+-- RSA-OAEP-512 + AES-GCM). Implementing RSA-OAEP in Lua is not feasible, so the
+-- QR-code login path is used instead. The server issues a short-lived JWT; the
+-- user scans it with SecureGo plus (which holds the private key on their phone);
+-- the server sees the phone's approval and grants the session without any
+-- credential encryption on the extension's side.
+--
+-- Prerequisite: QR login must be activated once via the browser at
+-- banking.umweltbank.de before this extension can be used.
+
+local BASE = "https://banking.umweltbank.de"
+
+-- ── QR auth endpoints (Atruvia/CAS layer) ───────────────────────────────────
+-- QR_INIT_UI_ENDPOINT   : starts the CAS session and returns the bank branding config.
+--                         Side-effect: sets the CAS_SESSION cookie needed by all later calls.
+-- QR_INIT_CODE_ENDPOINT : issues a signed JWT that encodes the login challenge.
+--                         The JWT is what gets encoded into the QR image.
+-- QR_STATUS_ENDPOINT    : polled to detect when the user has scanned the code.
+-- QR_LOGIN_ENDPOINT     : tells the backend "this JWT was approved" and advances the auth flow.
+local QR_INIT_UI_ENDPOINT   = BASE .. "/services_auth/auth-qr-service/api/init-ui?theme=LIGHT&locale=de-DE"
+local QR_INIT_CODE_ENDPOINT = BASE .. "/services_auth/auth-qr-service/api/init-qr-code"
+local QR_STATUS_ENDPOINT    = BASE .. "/services_auth/auth-qr-service/api/status"
+local QR_LOGIN_ENDPOINT     = BASE .. "/services_auth/auth-backend/api/authentication/qr-login"
+
+-- ── Portal OAuth endpoints ───────────────────────────────────────────────────
+-- CONSENT_ENDPOINT  : completes the CAS login and kicks off the portal OAuth
+--                     redirect chain (CAS → portal-oauth/login → oauth/authorize
+--                     → portal/login).  MoneyMoney follows all redirects
+--                     automatically, so intermediate Location headers are not accessible.
+-- AUTHORIZE_ENDPOINT: the portal's own OAuth 2.0 authorization endpoint. Calling it
+--                     directly (after CAS is already satisfied) short-circuits the
+--                     redirect chain and gives us the auth code in its Location header.
+-- TOKEN_ENDPOINT    : exchanges the auth code for an access_token cookie.
+-- REDIRECT_URI      : where the portal expects the auth code to land. Must match
+--                     exactly what the portal registered.
+local CONSENT_ENDPOINT   = BASE .. "/services_auth/auth-backend/api/consent/execution"
+local AUTHORIZE_ENDPOINT = BASE .. "/services_cloud/portal/portal-oauth/oauth/authorize"
+local TOKEN_ENDPOINT     = BASE .. "/services_cloud/portal/portal-oauth/oauth/token"
+local REDIRECT_URI       = BASE .. "/services_cloud/portal/login"
+
+-- ── Data endpoints ───────────────────────────────────────────────────────────
+-- KONTO_GROUP_ENDPOINT: lists all accounts grouped by type; filtered for art == "DEPOT".
+-- AKTUELL_ENDPOINT    : "aktuellekurse" = "current prices". Takes the previous holdings
+--                       structure as the request body and returns it with refreshed prices.
+local KONTO_GROUP_ENDPOINT = BASE .. "/services_cloud/portal/proxy-gateway/serviceproxy/konto-service/v2/konto/group"
+local AKTUELL_ENDPOINT     = BASE .. "/services_cloud/portal/proxy-gateway/serviceproxy/wporder-bestand-service-v1/rest/de.fiduciagad.dzwp.wporder.bestand.v1.bestand.BestandApi/aktuellekurse"
+
+-- ─────────────────────────────────────────────────────────────────────────────
+-- GF(256) – Galois Field arithmetic
+-- ─────────────────────────────────────────────────────────────────────────────
+--
+-- A "Galois Field" GF(2^8) is a set of 256 elements (the integers 0-255) with
+-- addition and multiplication operations that are closed (results always stay in
+-- 0-255) and obey the usual algebraic laws.
+--
+-- Addition in GF(256) is simple XOR (no carry between bits).
+--
+-- Multiplication is trickier because x*y can exceed 255. To keep results inside
+-- the field, results are reduced by a "primitive polynomial" – in this case
+--   x^8 + x^4 + x^3 + x^2 + 1  (binary 1_0001_1101 = 0x11D)
+-- Analogous to modular arithmetic: when a product overflows, XOR with (i.e.
+-- subtract) the polynomial to bring it back below 256.
+--
+-- EXP and LOG tables are pre-built to make multiplication fast, analogous to
+-- natural logarithm tables.  Instead of computing a*b directly, the result is:
+--   GF_EXP[ (GF_LOG[a] + GF_LOG[b]) mod 255 ]
+-- This turns 8 XOR steps into 2 table lookups and 1 addition.
+--
+-- GF_EXP[i] = 2^i in GF(256), where 2 is the primitive element (generator).
+-- GF_LOG[v] = the exponent i such that 2^i = v.
+-- We extend EXP to 511 entries so that (log_a + log_b) never needs a conditional
+-- modulo when the sum is between 255 and 510.
+
+local GF_EXP, GF_LOG = {}, {}
+do
+  local x = 1
+  for i = 0, 254 do
+    GF_EXP[i] = x
+    GF_LOG[x] = i
+    x = x * 2
+    -- Multiplying by 2 in GF(256): shift left 1 bit.
+    -- If the result exceeds 255 (i.e. the x^8 bit is set), XOR with 0x11D
+    -- to reduce back into the field (equivalent to subtracting the polynomial).
+    if x > 255 then x = (x ~ 0x11D) & 0xFF end
+  end
+  for i = 255, 511 do GF_EXP[i] = GF_EXP[i - 255] end
+end
+
+local function gf_mul(a, b)
+  if a == 0 or b == 0 then return 0 end
+  -- log(a) + log(b) mod 255 gives the exponent of the product.
+  return GF_EXP[(GF_LOG[a] + GF_LOG[b]) % 255]
+end
+
+-- ─────────────────────────────────────────────────────────────────────────────
+-- Reed-Solomon error correction encoder
+-- ─────────────────────────────────────────────────────────────────────────────
+--
+-- Reed-Solomon adds n_ec "check bytes" to a block of data bytes.  A QR decoder
+-- can use those check bytes to detect and correct errors (damaged or unreadable
+-- modules) – EC Level L tolerates up to ~7% of the symbol being destroyed.
+--
+-- Mathematically, RS treats the data as the coefficients of a polynomial D(x)
+-- and computes the remainder of D(x) * x^n_ec divided by a generator polynomial
+-- G(x).  That remainder IS the error-correction codewords.
+--
+-- The generator polynomial is the product of linear factors over GF(256):
+--   G(x) = (x - α^0)(x - α^1)...(x - α^(n_ec-1))
+-- where α = 2 (the primitive element).  rs_generator builds G(x) iteratively by
+-- multiplying in one factor at a time.
+
+local function rs_generator(n)
+  local g = {1}  -- start with the polynomial "1"
+  for i = 0, n - 1 do
+    -- Multiply g by (x - α^i) = (x + α^i) in GF(256) (subtraction = XOR = addition)
+    local ng = {}
+    for j = 1, #g + 1 do ng[j] = 0 end
+    for j = 1, #g do
+      ng[j]   = ng[j]   ~ gf_mul(g[j], GF_EXP[i])
+      ng[j+1] = ng[j+1] ~ g[j]
+    end
+    g = ng
+  end
+  return g
+end
+
+local function rs_encode(data, n_ec)
+  local gen = rs_generator(n_ec)
+  -- Append n_ec zero bytes as placeholders for the remainder
+  local msg = {}
+  for _, v in ipairs(data) do msg[#msg+1] = v end
+  for _ = 1, n_ec do msg[#msg+1] = 0 end
+  -- Polynomial long division: for each data byte, eliminate the leading term
+  -- by XOR-adding the generator scaled by that byte.
+  for i = 1, #data do
+    local c = msg[i]
+    if c ~= 0 then
+      for j = 1, #gen do
+        msg[i+j-1] = msg[i+j-1] ~ gf_mul(gen[j], c)
+      end
+    end
+  end
+  -- The first #data positions are now zero (consumed); the remainder is the EC bytes.
+  local ec = {}
+  for i = #data + 1, #msg do ec[#ec+1] = msg[i] end
+  return ec
+end
+
+-- ─────────────────────────────────────────────────────────────────────────────
+-- QR code capacity tables for Error Correction Level L ("Low", ~7% recovery)
+-- ─────────────────────────────────────────────────────────────────────────────
+--
+-- Each QR version (= size tier) splits its codewords into one or two groups of
+-- blocks.  Each block gets its own RS error correction independently.
+--
+-- Using multiple smaller blocks is better than one giant block: if a contiguous
+-- region is damaged, no single block loses more data than RS can handle.
+--
+-- Layout of EC_L[version]:
+--   { ec_per_block,                -- RS check bytes added to every block
+--     group1_block_count, group1_data_cw_per_block,   -- first group
+--     group2_block_count, group2_data_cw_per_block }  -- second group (0 if unused)
+--
+-- Group 2 blocks carry exactly one extra data codeword when the total count
+-- can't be divided evenly among identical blocks.
+--
+-- Example – version 20:
+--   {28, 3, 107, 5, 108} → 3 blocks × 107 data cw  +  5 blocks × 108 data cw
+--   Each block also gets 28 RS check bytes → 8 blocks × 135 total cw each.
+
+local EC_L = {
+  [1]  = { 7, 1, 19, 0,  0},  [2]  = {10, 1, 34, 0,  0},
+  [3]  = {15, 1, 55, 0,  0},  [4]  = {20, 1, 80, 0,  0},
+  [5]  = {26, 1,108, 0,  0},  [6]  = {18, 2, 68, 0,  0},
+  [7]  = {20, 2, 78, 0,  0},  [8]  = {24, 2, 97, 0,  0},
+  [9]  = {30, 2,116, 0,  0},  [10] = {18, 2, 68, 2, 69},
+  [11] = {20, 4, 81, 0,  0},  [12] = {24, 2, 92, 2, 93},
+  [13] = {26, 4,107, 0,  0},  [14] = {30, 3,115, 1,116},
+  [15] = {22, 5, 87, 1, 88},  [16] = {24, 5, 98, 1, 99},
+  [17] = {28, 1,107, 5,108},  [18] = {30, 5,120, 1,121},
+  [19] = {28, 3,113, 4,114},  [20] = {28, 3,107, 5,108},
+  [21] = {28, 4,116, 4,117},  [22] = {28, 2,111, 7,112},
+  [23] = {30, 4,121, 5,122},  [24] = {30, 6,117, 4,118},
+  [25] = {26, 8,106, 4,107},
+}
+
+-- Maximum USER data bytes encodable per version at EC Level L.
+-- Smaller than the total codeword count because a portion is reserved for RS
+-- check bytes.  A 840-byte JWT typically requires version 20 (capacity 858).
+local CAP_L = {
+   17, 32, 53, 78,106,134,154,192,230,271,
+  321,367,425,458,520,586,644,718,792,858,
+  929,1003,1091,1171,1273
+}
+
+-- Centre coordinates of alignment patterns per version.
+-- Alignment patterns are 5×5 "bull's-eye" squares placed at every pairwise
+-- intersection of the listed coordinates.  They help QR scanners correct
+-- perspective distortion and lens curvature in larger symbols.
+-- Version 1 has no alignment patterns; they only appear from version 2 up.
+-- Intersections that would overlap a finder pattern or the timing strip are
+-- skipped automatically during placement (see place_alignment).
+local ALIGN = {
+  [2]={6,18},             [3]={6,22},             [4]={6,26},
+  [5]={6,30},             [6]={6,34},             [7]={6,22,38},
+  [8]={6,24,42},          [9]={6,26,46},          [10]={6,28,50},
+  [11]={6,30,54},         [12]={6,32,58},         [13]={6,34,62},
+  [14]={6,26,46,66},      [15]={6,26,48,70},      [16]={6,26,50,74},
+  [17]={6,30,54,78},      [18]={6,30,56,82},      [19]={6,30,58,86},
+  [20]={6,34,62,90},      [21]={6,28,50,72,94},   [22]={6,26,50,74,98},
+  [23]={6,30,54,78,102},  [24]={6,28,54,80,106},  [25]={6,32,58,84,110},
+}
+
+-- ─────────────────────────────────────────────────────────────────────────────
+-- Matrix helpers
+-- ─────────────────────────────────────────────────────────────────────────────
+
+-- 0-indexed 2-D table of nils. nil = module not yet assigned (data can go here).
+local function new_mat(n)
+  local m = {}
+  for r = 0, n-1 do m[r] = {} end
+  return m
+end
+
+-- Returns true when (r,c) is a FUNCTION module that must never be data-masked.
+-- Masking is only applied to data modules; function modules have fixed values
+-- defined by the spec and must survive unchanged regardless of which mask is used.
+local function is_func(ver, n, r, c)
+  -- Each of the three finder patterns occupies a 7×7 square, surrounded by a
+  -- 1-module white separator, with format-info modules beyond that – giving a
+  -- 9×9 reserved corner.  There is no finder in the bottom-right corner, which
+  -- lets scanners determine symbol orientation.
+  if r <= 8 and c <= 8 then return true end    -- top-left
+  if r <= 8 and c >= n-8 then return true end  -- top-right
+  if r >= n-8 and c <= 8 then return true end  -- bottom-left
+
+  -- Timing patterns: alternating dark/light row 6 and column 6 between finders.
+  -- They let the decoder calculate the exact module grid even in blurry images.
+  if r == 6 or c == 6 then return true end
+
+  -- Alignment patterns: 5×5 squares at all pairwise intersections of ALIGN coords.
+  local ap = ALIGN[ver]
+  if ap then
+    for _, cr in ipairs(ap) do
+      for _, cc in ipairs(ap) do
+        if math.abs(r-cr) <= 2 and math.abs(c-cc) <= 2 then return true end
+      end
+    end
+  end
+
+  -- Version information block (QR code version 7 and above): two 6×3 rectangles encoding the version number.
+  if ver >= 7 then
+    if r >= n-11 and r <= n-9 and c <= 5 then return true end
+    if c >= n-11 and c <= n-9 and r <= 5 then return true end
+  end
+
+  return false
+end
+
+-- ─────────────────────────────────────────────────────────────────────────────
+-- Function-pattern placement
+-- ─────────────────────────────────────────────────────────────────────────────
+
+-- Finder pattern: a 7×7 "bull's-eye" (dark border, light ring, dark 3×3 centre)
+-- surrounded by a 1-module white separator.  Three are placed in the corners;
+-- the missing fourth corner uniquely identifies the symbol's orientation.
+-- The distinctive concentric-square pattern is detectable at any scale and angle.
+local function place_finder(m, r0, c0)
+  for dr = -1, 7 do
+    for dc = -1, 7 do
+      local val
+      if dr == -1 or dr == 7 or dc == -1 or dc == 7 then
+        val = 0  -- white separator border
+      elseif dr == 0 or dr == 6 or dc == 0 or dc == 6 then
+        val = 1  -- dark outer ring of the 7×7 square
+      elseif dr >= 2 and dr <= 4 and dc >= 2 and dc <= 4 then
+        val = 1  -- dark 3×3 centre square
+      else
+        val = 0  -- light ring between outer and centre
+      end
+      local r, c = r0+dr, c0+dc
+      -- Guard against the top-left finder's separator going to row -1
+      if m[r] then m[r][c] = val end
+    end
+  end
+end
+
+-- Alignment pattern: a 5×5 square (dark border, light ring, single dark centre).
+-- The nil-check prevents overwriting timing-pattern or finder-pattern modules
+-- that happen to lie within the 5×5 area of a theoretically-placed pattern.
+local function place_alignment(m, cr, cc)
+  for dr = -2, 2 do
+    for dc = -2, 2 do
+      local val = (dr==-2 or dr==2 or dc==-2 or dc==2 or (dr==0 and dc==0)) and 1 or 0
+      if m[cr+dr] and m[cr+dr][cc+dc] == nil then
+        m[cr+dr][cc+dc] = val
+      end
+    end
+  end
+end
+
+-- ─────────────────────────────────────────────────────────────────────────────
+-- Format information and version information
+-- ─────────────────────────────────────────────────────────────────────────────
+
+-- EC Level L is represented as binary "01" (= 1) in the format info bits.
+local EC_L_IND = 1
+
+-- Encodes the 5-bit format data (EC indicator + 3-bit mask number) into a 15-bit
+-- codeword using a BCH(15,5) error-correcting code with generator 0x537.
+--
+-- The BCH code means a QR decoder can recover the format info even if up to 3
+-- of the 15 modules are destroyed.
+--
+-- The final XOR with 0x5412 is a fixed mask that ensures the 15-bit string is
+-- never all-zeros (which would be indistinguishable from a blank row/column).
+local function format_info_word(mask)
+  local data = EC_L_IND * 8 + mask  -- 5-bit input: [ec1 ec0 m2 m1 m0]
+  local d = data << 10
+  local g = 0x537  -- BCH generator: x^10+x^8+x^5+x^4+x^2+x+1
+  for i = 14, 10, -1 do
+    if (d >> i) & 1 == 1 then d = d ~ (g << (i-10)) end
+  end
+  return ((data << 10) | (d & 0x3FF)) ~ 0x5412
+end
+
+-- Encodes the version number (7-25) into an 18-bit word using a BCH(18,6) code
+-- with generator 0x1F25.  Only needed for QR code version 7 and above; smaller symbols
+-- do not carry version information modules (the reader infers the version from
+-- the symbol size).
+local function version_info_word(ver)
+  local d = ver << 12
+  local g = 0x1F25  -- BCH generator: x^12+x^11+x^10+x^9+x^8+x^5+x^2+1
+  for i = 17, 12, -1 do
+    if (d >> i) & 1 == 1 then d = d ~ (g << (i-12)) end
+  end
+  return (ver << 12) | (d & 0xFFF)
+end
+
+-- Writes the 15-bit format info word into TWO copies within the matrix.
+-- Two copies ensure that damage to one doesn't prevent decoding.
+--
+--   Copy 1: L-shaped strip adjacent to the top-left finder.
+--     • Row 8, cols 0-5 then 7-8  (horizontal arm; col 6 is the timing pattern)
+--     • Col 8, rows 7-0            (vertical arm; row 6 is the timing pattern)
+--   Copy 2: mirrored at the top-right and bottom-left finders.
+--     • Row 8, cols n-1 down to n-8  (top-right, same bit order as Copy 1)
+--     • Col 8, rows n-7 up to n-1   (bottom-left, continues the same sequence)
+--
+-- Bit order: f14 (MSB) placed first at (8,0); f0 (LSB) placed last at (0,8).
+-- The same MSB-first order applies to Copy 2.
+local function place_format(m, n, fi)
+  local bits = {}
+  for b = 14, 0, -1 do bits[#bits+1] = (fi >> b) & 1 end
+
+  -- Copy 1 horizontal arm (row 8): f14 … f7  (bi ends at 8, col 8 = f7)
+  local bi = 1
+  for c = 0, 5 do m[8][c] = bits[bi]; bi=bi+1 end
+  m[8][7] = bits[bi]; bi=bi+1   -- skip col 6 (timing strip)
+  m[8][8] = bits[bi]; bi=bi+1   -- corner module; bi is now 9
+
+  -- Copy 1 vertical arm (col 8): f6 … f0  (bi continues from 9)
+  for r = 7, 0, -1 do
+    if r ~= 6 then m[r][8] = bits[bi]; bi=bi+1 end  -- skip row 6 (timing strip)
+  end
+
+  -- Copy 2 top-right (row 8, cols n-1 down to n-8): f14 … f7
+  bi = 1
+  for c = n-1, n-8, -1 do m[8][c] = bits[bi]; bi=bi+1 end
+
+  -- Copy 2 bottom-left (col 8, rows n-7 up to n-1): f6 … f0
+  bi = 9
+  for r = n-7, n-1 do m[r][8] = bits[bi]; bi=bi+1 end
+end
+
+-- ─────────────────────────────────────────────────────────────────────────────
+-- Data encoding – byte mode, EC Level L
+-- ─────────────────────────────────────────────────────────────────────────────
+
+local function encode_data(text, ver)
+  local t = EC_L[ver]
+  local ec_pw, g1n, g1d, g2n, g2d = t[1], t[2], t[3], t[4], t[5]
+  local total_data = g1n*g1d + g2n*g2d  -- total data codewords across all blocks
+
+  -- ── Build the raw bit stream ─────────────────────────────────────────────
+  local bits = {}
+  local function push(v, nb)
+    for b = nb-1, 0, -1 do bits[#bits+1] = (v>>b)&1 end
+  end
+
+  -- Mode indicator: 0100 = byte mode (encodes arbitrary bytes, simplest for JWT)
+  push(4, 4)
+  -- Character count: 8 bits for versions 1-9, 16 bits for versions 10+
+  push(#text, ver < 10 and 8 or 16)
+  -- Payload bytes
+  for i = 1, #text do push(string.byte(text,i), 8) end
+
+  -- Terminator: up to 4 zero bits to signal end of data
+  local avail = total_data*8 - #bits
+  for _ = 1, math.min(4, avail) do bits[#bits+1] = 0 end
+  -- Pad to the next byte boundary
+  while #bits % 8 ~= 0 do bits[#bits+1] = 0 end
+  -- Fill remaining capacity with alternating pad bytes 0xEC / 0x11
+  -- (spec-defined; they look like random data to avoid accidental patterns)
+  local pad = {0xEC, 0x11}; local pi = 1
+  while #bits < total_data*8 do
+    push(pad[pi], 8); pi = (pi%2)+1
+  end
+
+  -- ── Convert bit stream to codewords (bytes) ──────────────────────────────
+  local cw = {}
+  for i = 1, #bits, 8 do
+    local b = 0
+    for j = 0, 7 do b = b*2 + (bits[i+j] or 0) end
+    cw[#cw+1] = b
+  end
+
+  -- ── Split codewords into blocks ──────────────────────────────────────────
+  -- Each block is RS-encoded independently.  Using multiple blocks means that
+  -- a contiguous burst of damage only destroys a few bytes in each block, which
+  -- RS can correct, rather than concentrating the damage in one unrecoverable block.
+  local blocks = {}; local pos = 1
+  for _ = 1, g1n do
+    local blk = {}
+    for j = 1, g1d do blk[j] = cw[pos]; pos=pos+1 end
+    blocks[#blocks+1] = blk
+  end
+  for _ = 1, g2n do  -- group 2 blocks carry one extra data codeword each
+    local blk = {}
+    for j = 1, g2d do blk[j] = cw[pos]; pos=pos+1 end
+    blocks[#blocks+1] = blk
+  end
+
+  -- ── Reed-Solomon error correction per block ──────────────────────────────
+  local ec_blocks = {}
+  for _, blk in ipairs(blocks) do
+    ec_blocks[#ec_blocks+1] = rs_encode(blk, ec_pw)
+  end
+
+  -- ── Interleave data codewords, then EC codewords ─────────────────────────
+  -- Interleaving spreads each block's bytes across the whole symbol.  If one
+  -- region of the printed QR code is damaged, each block only loses a few
+  -- scattered bytes rather than a long contiguous run – well within RS capacity.
+  local final = {}
+  local max_d = g2n > 0 and g2d or g1d
+  for i = 1, max_d do
+    for _, blk in ipairs(blocks) do
+      if blk[i] then final[#final+1] = blk[i] end  -- group 1 blocks are 1 shorter
+    end
+  end
+  for i = 1, ec_pw do
+    for _, ec in ipairs(ec_blocks) do
+      if ec[i] then final[#final+1] = ec[i] end
+    end
+  end
+  return final
+end
+
+-- ─────────────────────────────────────────────────────────────────────────────
+-- Matrix construction
+-- ─────────────────────────────────────────────────────────────────────────────
+
+local function build_matrix(ver, codewords)
+  -- Version N produces an (4N+17) × (4N+17) module grid.
+  -- Version 1 = 21×21 (the smallest), version 40 = 177×177 (the largest).
+  local n = 4*ver + 17
+  local m = new_mat(n)  -- nil = unassigned (available for data)
+
+  -- ── Finder patterns (three corners) ─────────────────────────────────────
+  place_finder(m, 0,   0)    -- top-left
+  place_finder(m, 0,   n-7)  -- top-right
+  place_finder(m, n-7, 0)    -- bottom-left
+  -- (no bottom-right finder – the empty corner identifies symbol orientation)
+
+  -- ── Timing patterns ──────────────────────────────────────────────────────
+  -- Alternating dark/light modules along row 6 and column 6 between the finders.
+  -- A scanner counts these modules to determine the exact grid cell size.
+  for i = 8, n-9 do
+    m[6][i] = (i%2==0) and 1 or 0
+    m[i][6] = (i%2==0) and 1 or 0
+  end
+
+  -- ── Dark module ───────────────────────────────────────────────────────────
+  -- Always dark; placed at a fixed position defined by the spec.
+  -- Its purpose is largely historical – it prevents all-zero format info in
+  -- very small masks and helps some early decoders recognise valid symbols.
+  m[4*ver+9][8] = 1
+
+  -- ── Alignment patterns ───────────────────────────────────────────────────
+  local ap = ALIGN[ver]
+  if ap then
+    for _, cr in ipairs(ap) do
+      for _, cc in ipairs(ap) do
+        place_alignment(m, cr, cc)  -- skips overlapping finder/timing positions
+      end
+    end
+  end
+
+  -- ── Reserve format-info and version-info areas ───────────────────────────
+  -- Fill with 0 so that the zigzag data-placement loop (below) skips these spots.
+  -- The real format info bits are written AFTER masking is complete (place_format),
+  -- because the format word encodes which mask was chosen.
+  for i = 0, 8 do
+    if m[8][i]     == nil then m[8][i]     = 0 end
+    if m[i][8]     == nil then m[i][8]     = 0 end
+    if m[8][n-1-i] == nil then m[8][n-1-i] = 0 end
+    if m[n-1-i][8] == nil then m[n-1-i][8] = 0 end
+  end
+  if ver >= 7 then  -- version info blocks only from QR code version 7 onwards
+    for i = 0, 2 do for j = 0, 5 do
+      m[n-11+i][j] = 0; m[j][n-11+i] = 0
+    end end
+  end
+
+  -- ── Expand codewords into a flat bit array ───────────────────────────────
+  local bits = {}
+  for _, cw in ipairs(codewords) do
+    for b = 7, 0, -1 do bits[#bits+1] = (cw>>b)&1 end
+  end
+
+  -- ── Place data bits in a two-column zigzag, right to left ────────────────
+  -- The QR spec places data in pairs of adjacent columns, sweeping from the
+  -- right edge inward.  Within each column-pair the direction alternates:
+  -- first pair goes bottom-to-top, next goes top-to-bottom, etc.
+  -- Any module that is already set (function pattern) is skipped.
+  local bi = 1
+  local going_up = true
+  local col = n-1
+  while col >= 1 do
+    if col == 6 then col = col-1 end  -- col 6 is the vertical timing pattern; skip it
+    for step = 0, n-1 do
+      local row = going_up and (n-1-step) or step
+      for dc = 0, 1 do
+        local c = col-dc
+        if m[row][c] == nil then  -- nil means no function pattern here
+          m[row][c] = (bi <= #bits) and bits[bi] or 0
+          bi = bi+1
+        end
+      end
+    end
+    going_up = not going_up
+    col = col-2
+  end
+
+  return m, n
+end
+
+-- ─────────────────────────────────────────────────────────────────────────────
+-- Masking
+-- ─────────────────────────────────────────────────────────────────────────────
+--
+-- Masking XORs each DATA module with a boolean formula.  The goal is to break
+-- up regularities that could confuse a decoder – long runs of the same colour,
+-- 2×2 solid blocks, and patterns resembling finder symbols.
+--
+-- The spec defines 8 candidate mask patterns (indexed 0-7).  We try all eight,
+-- evaluate each with a penalty score, and keep the one with the lowest score.
+-- Function modules are NEVER masked; their fixed values must remain intact.
+
+local MASK_FN = {
+  function(r,c) return (r+c)%2==0 end,
+  function(r,_) return r%2==0 end,
+  function(_,c) return c%3==0 end,
+  function(r,c) return (r+c)%3==0 end,
+  function(r,c) return (r//2+c//3)%2==0 end,
+  function(r,c) return (r*c)%2+(r*c)%3==0 end,
+  function(r,c) return ((r*c)%2+(r*c)%3)%2==0 end,
+  function(r,c) return ((r+c)%2+(r*c)%3)%2==0 end,
+}
+
+local function apply_mask(m, n, ver, mask_id)
+  local fn = MASK_FN[mask_id+1]
+  local nm = new_mat(n)
+  for r = 0, n-1 do
+    for c = 0, n-1 do
+      local v = m[r][c] or 0
+      -- XOR only data modules; leave function patterns (finders, timing, …) alone
+      if not is_func(ver, n, r, c) and fn(r,c) then v = v~1 end
+      nm[r][c] = v
+    end
+  end
+  return nm
+end
+
+-- Evaluates how "scanner-friendly" a masked matrix is.  Lower score = better.
+-- We implement three of the four ISO 18004 penalty rules:
+--   Rule 1: long runs of same-colour modules in a row or column (+3 for run of 5,
+--           +1 for each additional module).  Runs confuse edge detectors.
+--   Rule 2: 2×2 blocks of same colour (+3 each). Solid areas look like finders.
+--   Rule 4: deviation from 50% dark-module ratio (+10 per 5% step away from 50%).
+--           A balanced symbol is easier to threshold under varying lighting.
+-- Rule 3 (finder-like subsequences) is omitted; the chosen mask is still good.
+local function penalty(m, n)
+  local p = 0
+
+  for r = 0, n-1 do
+    local function scan_run(get)
+      local run, cur = 0, -1
+      for i = 0, n-1 do
+        local v = get(r,i)
+        if v == cur then
+          run=run+1
+          if run==5 then p=p+3 elseif run>5 then p=p+1 end
+        else
+          cur=v; run=1
+        end
+      end
+    end
+    scan_run(function(r,c) return m[r][c] end)   -- horizontal scan
+    scan_run(function(r,c) return m[c][r] end)   -- vertical scan (swap indices)
+  end
+
+  for r = 0, n-2 do
+    for c = 0, n-2 do
+      local v = m[r][c]
+      if v==m[r][c+1] and v==m[r+1][c] and v==m[r+1][c+1] then p=p+3 end
+    end
+  end
+
+  local dark = 0
+  for r = 0, n-1 do for c = 0, n-1 do if m[r][c]==1 then dark=dark+1 end end end
+  local pct = dark*100//(n*n)
+  -- Distance to the nearest multiple-of-5 on both sides of 50%, divided by 5, ×10
+  p = p + math.min(math.abs(pct - pct%5 - 50)//5, math.abs((pct-pct%5+5) - 50)//5) * 10
+
+  return p
+end
+
+-- ─────────────────────────────────────────────────────────────────────────────
+-- High-level QR matrix generator
+-- ─────────────────────────────────────────────────────────────────────────────
+
+local function qr_matrix(text)
+  -- Choose the smallest version whose byte-mode capacity fits the text.
+  -- CAP_L[25] = 1273 is the absolute ceiling; JWT payloads from init-qr-code are
+  -- typically ~840 bytes (version 20), but the upper bound is guarded explicitly.
+  if #text > CAP_L[25] then
+    error(string.format(
+      "JWT zu lang für QR-Code (%d Bytes, max. %d für Version 25 EC-L).", #text, CAP_L[25]))
+  end
+  local ver = 1
+  for v = 1, 25 do
+    if CAP_L[v] and CAP_L[v] >= #text then ver=v; break end
+  end
+
+  local cw = encode_data(text, ver)
+  -- Build the base matrix: all function patterns + data, but NO format/mask yet.
+  local m_base, n = build_matrix(ver, cw)
+
+  -- Try all 8 masks, score each, keep the matrix with the lowest penalty.
+  -- Format info (which encodes the mask number) is placed here temporarily for
+  -- scoring purposes; the winning copy is kept in best_m.
+  local best_m, best_p = nil, math.huge
+  for mask = 0, 7 do
+    local mm = apply_mask(m_base, n, ver, mask)
+    local fi = format_info_word(mask)
+    local mc = new_mat(n)
+    for r=0,n-1 do for c=0,n-1 do mc[r][c]=mm[r][c] end end
+    place_format(mc, n, fi)
+    local p = penalty(mc, n)
+    if p < best_p then best_m, best_p = mc, p end
+  end
+
+  -- Version information (two 6×3 rectangles, only for QR code version 7 and above).
+  -- Written last because it doesn't interact with masking.
+  if ver >= 7 then
+    local vi = version_info_word(ver)
+    for i = 0, 2 do for j = 0, 5 do
+      local bit = (vi >> (i*6+j)) & 1
+      best_m[n-11+i][j] = bit  -- bottom-left block
+      best_m[j][n-11+i] = bit  -- top-right block
+    end end
+  end
+
+  return best_m, n
+end
+
+-- ─────────────────────────────────────────────────────────────────────────────
+-- PNG encoding (8-bit grayscale, uncompressed DEFLATE)
+-- ─────────────────────────────────────────────────────────────────────────────
+--
+-- MoneyMoney's Lua environment has no compression library, so DEFLATE's
+-- "store" mode (BTYPE = 00), which wraps raw data in 5-byte block headers
+-- without any compression.  This is legal per the DEFLATE and zlib specs and
+-- produces a valid PNG file – just a larger one than a compressed encoder would.
+--
+-- PNG chunk structure: 4-byte length | 4-byte type | data | 4-byte CRC32
+-- CRC32 covers the type and data fields.
+--
+-- The IDAT chunk contains a zlib stream (0x78 0x01 header + DEFLATE blocks +
+-- Adler-32 checksum trailer).  Adler-32 is the zlib checksum; CRC32 is used
+-- separately for the PNG chunk wrapper.
+--
+-- Each scanline is preceded by a 1-byte filter selector.  We use filter 0
+-- (None) on every row, which means "copy this row as-is" – the simplest and
+-- correct choice for a bi-level (black/white) grayscale image.
+
+local CRC_TABLE = {}
+do
+  -- Build a standard CRC-32 lookup table (polynomial 0xEDB88320, reflected form).
+  for i = 0, 255 do
+    local c = i
+    for _ = 1, 8 do
+      c = (c&1==1) and (0xEDB88320 ~ (c>>1)) or (c>>1)
+    end
+    CRC_TABLE[i] = c
+  end
+end
+
+local function crc32(data)
+  local crc = 0xFFFFFFFF
+  for i = 1, #data do
+    crc = CRC_TABLE[(crc~string.byte(data,i))&0xFF] ~ (crc>>8)
+  end
+  return (crc~0xFFFFFFFF) & 0xFFFFFFFF
+end
+
+-- Adler-32: a simpler running-sum checksum used inside the zlib wrapper.
+-- s1 = sum of all bytes + 1; s2 = sum of all s1 values. Both mod 65521 (prime).
+local function adler32(data)
+  local s1, s2 = 1, 0
+  for i = 1, #data do
+    s1 = (s1 + string.byte(data,i)) % 65521
+    s2 = (s2 + s1) % 65521
+  end
+  return (s2<<16) | s1
+end
+
+local function be4(v)  -- big-endian 4-byte encoding (used for PNG lengths/CRCs)
+  return string.char((v>>24)&0xFF,(v>>16)&0xFF,(v>>8)&0xFF,v&0xFF)
+end
+
+local function png_chunk(typ, data)
+  return be4(#data) .. typ .. data .. be4(crc32(typ..data))
+end
+
+local function make_png(pixels, w, h)
+  -- Prepend filter-type byte 0x00 (None) to each row before feeding into DEFLATE.
+  local rows = {}
+  for y = 0, h-1 do
+    rows[#rows+1] = "\0" .. pixels:sub(y*w+1, (y+1)*w)
+  end
+  local raw = table.concat(rows)
+  local a32 = adler32(raw)
+
+  -- DEFLATE store: 0x78 0x01 = zlib header (CMF=deflate, FLG=default compression).
+  -- Each uncompressed block: 1-byte BFINAL/BTYPE | 2-byte LEN | 2-byte NLEN | data.
+  -- LEN max is 65535; 65534 is used to avoid edge cases with the NLEN complement.
+  local parts = {"\x78\x01"}
+  local i = 1
+  while i <= #raw do
+    local len = math.min(65534, #raw-i+1)
+    local last = (i+len-1 >= #raw) and 1 or 0  -- BFINAL=1 on last block
+    local nlen = (~len) & 0xFFFF                -- one's complement of len
+    parts[#parts+1] = string.char(last, len&0xFF, (len>>8)&0xFF, nlen&0xFF, (nlen>>8)&0xFF)
+    parts[#parts+1] = raw:sub(i, i+len-1)
+    i = i+len
+  end
+  parts[#parts+1] = be4(a32)  -- Adler-32 trailer closes the zlib stream
+  local idat = table.concat(parts)
+
+  local ihdr = string.char(
+    (w>>24)&0xFF,(w>>16)&0xFF,(w>>8)&0xFF,w&0xFF,
+    (h>>24)&0xFF,(h>>16)&0xFF,(h>>8)&0xFF,h&0xFF,
+    8, 0, 0, 0, 0  -- bit depth=8, colour type=0 (grayscale), no interlace
+  )
+  return "\x89PNG\r\n\x1a\n"
+      .. png_chunk("IHDR", ihdr)
+      .. png_chunk("IDAT", idat)
+      .. png_chunk("IEND", "")
+end
+
+-- ─────────────────────────────────────────────────────────────────────────────
+-- QR code → PNG image
+-- ─────────────────────────────────────────────────────────────────────────────
+
+local function qr_png(text, scale, quiet)
+  -- scale: each QR module becomes scale×scale pixels (4 = ~80px for version 1)
+  -- quiet: white border in modules; the spec requires at least 4 on every side
+  scale = scale or 4
+  quiet = quiet or 4
+  local mat, n = qr_matrix(text)
+  local sz = (n + 2*quiet) * scale
+  local pixel_parts = {}
+  for row = -quiet, n+quiet-1 do
+    local row_pixels = {}
+    for col = -quiet, n+quiet-1 do
+      -- Modules outside the QR matrix (quiet zone) are white.
+      local is_dark = (row >= 0 and row < n and col >= 0 and col < n
+                       and mat[row] and mat[row][col] == 1)
+      row_pixels[#row_pixels+1] = string.rep(is_dark and "\0" or "\xFF", scale)
+    end
+    local row_str = table.concat(row_pixels)
+    -- Repeat each pixel-row `scale` times to produce square modules.
+    for _ = 1, scale do pixel_parts[#pixel_parts+1] = row_str end
+  end
+  return make_png(table.concat(pixel_parts), sz, sz)
+end
+
+-- ─────────────────────────────────────────────────────────────────────────────
+-- Utilities
+-- ─────────────────────────────────────────────────────────────────────────────
+
+local function url_encode(s)
+  return (s:gsub("[^%w%-_.~]", function(c)
+    return string.format("%%%02X", string.byte(c))
+  end))
+end
+
+-- Pseudo-random UUID v4 for the OAuth state parameter.
+-- Collision probability is negligible for single-user interactive sessions.
+local function uuid()
+  local t = {}
+  for i = 1, 32 do t[i] = string.format("%x", math.random(0,15)) end
+  table.insert(t, 9,  "-"); table.insert(t, 14, "-")
+  table.insert(t, 19, "-"); table.insert(t, 24, "-")
+  return table.concat(t)
+end
+
+-- ─────────────────────────────────────────────────────────────────────────────
+-- Session state (module-level; persists across InitializeSession2 phases)
+-- ─────────────────────────────────────────────────────────────────────────────
+
+local g_jwt      = nil   -- QR challenge JWT (used to poll status and call qr-login)
+local g_phase    = 0     -- counts how many times InitializeSession2 has been called
+local g_depot    = nil   -- depot account object from konto/group (currently unused)
+local g_holdings = nil   -- last aktuellekurse response payload; reused as next request body
+
+-- ─────────────────────────────────────────────────────────────────────────────
+-- MoneyMoney extension
+-- ─────────────────────────────────────────────────────────────────────────────
+
+WebBanking {
+  version     = 1.0,
+  url         = "https://banking.umweltbank.de",
+  services    = {"Umweltbank Depot"},
+  description = "Umweltbank Depot-Konten via QR-Code / SecureGo plus",
+}
+
+function SupportsBank(protocol, bank)
+  return protocol == ProtocolWebBanking and bank.name == "Umweltbank Depot"
+end
+
+-- MoneyMoney calls InitializeSession2 once to show the challenge, then again
+-- after the user clicks OK.  g_phase tracks which call is being handled.
+function InitializeSession2(protocol, bank, username, reserved, password)
+  g_phase = g_phase + 1
+
+  -- ── Phase 1: start a CAS session and emit the QR code challenge ──────────
+  if g_phase == 1 then
+    -- init-ui sets the CAS_SESSION cookie in Connection()'s cookie jar.
+    -- Without it, init-qr-code returns "Session not found".
+    -- It also returns qrCodeLoginAllowed, which tells us whether the user has
+    -- ever opted into QR login in the browser.  If not, SecureGo plus won't
+    -- recognise the QR code, so the extension fails immediately with actionable instructions.
+    local ui_resp = connection:get(QR_INIT_UI_ENDPOINT)
+    local ui_data = JSON(ui_resp):dictionary()
+    if ui_data["qrCodeLoginAllowed"] == false then
+      error("QR-Code Login ist noch nicht aktiviert.\n\n"
+          .. "Bitte öffnen Sie banking.umweltbank.de im Browser, melden Sie sich "
+          .. "an und aktivieren Sie den QR-Code Login unter Einstellungen → "
+          .. "SecureGo plus. Danach kann diese Erweiterung genutzt werden.")
+    end
+
+    local resp = connection:post(QR_INIT_CODE_ENDPOINT, "", "application/json")
+    local data = JSON(resp):dictionary()
+    -- The JWT encodes the login challenge; SecureGo plus decodes it and signs
+    -- a confirmation that travels back to the server via the push notification.
+    g_jwt = data["qrCodeJwt"]
+    if not g_jwt or g_jwt == "" then
+      error("QR-Code konnte nicht abgerufen werden.")
+    end
+
+    -- Encode the JWT as a QR image and hand it to MoneyMoney as an image challenge.
+    -- MoneyMoney will display the PNG to the user and call us again (phase 2)
+    -- after they click OK.
+    local png = qr_png(g_jwt, 4, 4)
+    return {
+      title     = "Umweltbank QR-Login",
+      challenge = png,
+      label     = "Bitte QR-Code mit SecureGo plus scannen und dann OK klicken.",
+    }
+
+  -- ── Phase 2: complete the authentication chain ───────────────────────────
+  elseif g_phase == 2 then
+
+    -- Poll the status endpoint until SecureGo plus has approved the scan.
+    -- The browser normally does this with short-polling every 2 seconds.
+    local approved = false
+    for _ = 1, 90 do  -- 90 × 2 s = 3 minutes maximum
+      local sr = connection:request("GET", QR_STATUS_ENDPOINT, nil, nil,
+        {["Authorization"] = "Bearer " .. g_jwt})
+      local st = JSON(sr):dictionary()
+      local state = st["state"]
+      if state == "APPROVED" then
+        approved = true; break
+      elseif state == "REJECTED" or state == "CANCELLED" then
+        -- The user actively declined the request in SecureGo plus.
+        error("QR-Code Login wurde in SecureGo plus abgelehnt. Bitte erneut versuchen.")
+      elseif state == "EXPIRED" then
+        -- The JWT has a short TTL; if the user takes too long to open SecureGo plus
+        -- the server invalidates it before they can scan.
+        error("QR-Code abgelaufen. Bitte die Anmeldung neu starten und den Code innerhalb von 3 Minuten scannen.")
+      end
+      MM.sleep(2000)
+    end
+    if not approved then
+      error("QR-Code Timeout: Bitte erneut versuchen und den Code innerhalb von 3 Minuten scannen.")
+    end
+
+    -- qr-login advances the CAS authentication state to "completed".
+    -- The server checks that the JWT was genuinely approved by SecureGo plus.
+    local lr = connection:request("POST", QR_LOGIN_ENDPOINT, "", "application/json",
+      {["Authorization"] = "Bearer " .. g_jwt})
+    local ld = JSON(lr):dictionary()
+    local apr = ld["authenticationProcessResponse"]
+    if not apr then error("qr-login: unerwartete Antwort vom Server.") end
+
+    if not apr["authenticationProcessCompleted"] then
+      -- If the server says the first step is QR_CODE_FIRST_LOGIN, the user has
+      -- never used QR login before.  They need to activate it in the browser once
+      -- (Settings → QR-Code Login), because SecureGo plus only gets registered
+      -- for QR login after the user opts in interactively.
+      local ns = apr["nextAuthenticationProcessStep"]
+      if ns then
+        for _, a in ipairs(ns["actions"] or {}) do
+          if a["stepType"] == "QR_CODE_FIRST_LOGIN" then
+            error("Bitte aktivieren Sie den QR-Code Login zuerst einmal im Browser "
+                .."unter banking.umweltbank.de (Menü → QR-Code Login).")
+          end
+        end
+      end
+      error("QR-Authentifizierung nicht abgeschlossen.")
+    end
+
+    -- consent/execution finalises CAS and triggers the portal OAuth redirect chain:
+    --   CAS → /portal-oauth/login?code=... → /oauth/authorize?... → /portal/login
+    -- MoneyMoney's Connection() (NSURLSession-based) follows all HTTP redirects
+    -- automatically, so intermediate Location headers are not accessible.
+    local _, _, _, _, ch = connection:request("POST", CONSENT_ENDPOINT,
+      '{"useBrowserDetection":false}', "application/json")
+
+    local portal_code = nil
+
+    -- Attempt A: if Connection() stopped at the first 302 (unlikely but possible
+    -- depending on MoneyMoney version), ch will contain a Location header with the
+    -- portal-oauth/login URL and its auth code.
+    if ch then
+      local loc = ch["Location"] or ch["location"]
+      if loc then
+        local _, _, _, _, plh = connection:request("GET", loc, nil, nil)
+        if plh then
+          local aloc = plh["Location"] or plh["location"]
+          if aloc then
+            local _, _, _, _, ahl = connection:request("GET", aloc, nil, nil)
+            if ahl then
+              local floc = ahl["Location"] or ahl["location"]
+              if floc then portal_code = floc:match("[?&]code=([^&]+)") end
+            end
+          end
+        end
+      end
+    end
+
+    -- Attempt B: now that CAS is satisfied, calling oauth/authorize directly
+    -- should return a 302 to REDIRECT_URI with the portal auth code in the URL.
+    -- This bypasses the multi-step redirect chain entirely.
+    if not portal_code then
+      local state = uuid()
+      local auth_url = AUTHORIZE_ENDPOINT
+          .. "?redirect_uri=" .. url_encode(REDIRECT_URI)
+          .. "&response_type=code&state=" .. state
+          .. "&client_id=online-banking"
+      local _, _, _, _, ah = connection:request("GET", auth_url, nil, nil)
+      if ah then
+        local fl = ah["Location"] or ah["location"]
+        if fl then portal_code = fl:match("[?&]code=([^&]+)") end
+      end
+    end
+
+    if not portal_code then
+      error("Portal-OAuth fehlgeschlagen: Auth-Code nicht ermittelbar. "
+          .."Bitte einen GitHub-Issue mit diesem Fehler erstellen.")
+    end
+
+    -- Exchange the portal auth code for an access_token.
+    -- The server sets access_token and refresh_token as HttpOnly cookies, making
+    -- them unreadable from Lua – Connection() stores and forwards them automatically
+    -- with every subsequent request to banking.umweltbank.de.
+    -- We still parse the response to catch failures early (e.g. expired or
+    -- already-used auth code) rather than seeing a silent auth error in ListAccounts.
+    local tok_resp = connection:request("POST", TOKEN_ENDPOINT,
+      "code=" .. portal_code
+        .. "&grant_type=authorization_code"
+        .. "&redirect_uri=" .. url_encode(REDIRECT_URI),
+      "application/x-www-form-urlencoded",
+      {["X-VP-App-Locale"] = "de-DE"})
+    local tok_data = JSON(tok_resp):dictionary()
+    if tok_data["error"] then
+      error("OAuth Token-Austausch fehlgeschlagen: "
+          .. (tok_data["error_description"] or tok_data["error"]))
+    end
+  end
+end
+
+function ListAccounts(knownAccounts)
+  local resp = connection:get(KONTO_GROUP_ENDPOINT, {["X-VP-App-Locale"] = "de-DE"})
+  local data = JSON(resp):dictionary()
+
+  local accounts = {}
+  for _, grp in ipairs(data["groups"] or {}) do
+    for _, konto in ipairs(grp["konten"] or {}) do
+      if konto["art"] == "DEPOT" then
+        g_depot = konto
+        accounts[#accounts+1] = {
+          name          = konto["bezeichnung"] or "Umweltbank Depot",
+          accountNumber = konto["kontonummer"] or konto["iban"] or "",
+          currency      = "EUR",
+          type          = AccountTypePortfolio,
+        }
+      end
+    end
+  end
+  if #accounts == 0 then
+    error("Kein Depot-Konto in konto/group gefunden (art == 'DEPOT').")
+  end
+  return accounts
+end
+
+function RefreshAccount(account, since)
+  -- aktuellekurse ("current prices") is a stateful endpoint: it takes the
+  -- current holdings structure as the request body and returns the same
+  -- structure with refreshed market prices.
+  --
+  -- On the first call g_holdings is nil, so an empty positionen list is sent.
+  -- The server is expected to populate it from the actual account state.
+  -- If it refuses (returns no payload), a separate initial-holdings endpoint
+  -- is likely needed – the error below surfaces this for investigation.
+  --
+  -- On subsequent calls the previous response payload is reused as the new
+  -- request body, which keeps depot tranche metadata intact.
+  local req_body
+  if g_holdings then
+    req_body = JSON:encode(g_holdings)
+  else
+    req_body = '{"depotwert":0,"entwicklungSeitEinstandBetrag":0,'
+      .. '"entwicklungSeitEinstandProzent":0,"einstandsDepotwert":0,'
+      .. '"entwicklungSeitEinstandAllePositionenEUR":0,'
+      .. '"kurswertBewertetePositionen":0,"anzahlBewerteteDepotpositionen":0,'
+      .. '"anzahlVerarbeiteteDepotpositionen":0,"depotart":"DEFAULT",'
+      .. '"positionen":[]}'
+  end
+
+  local resp = connection:request(
+    "POST", AKTUELL_ENDPOINT, req_body, "application/json",
+    {["X-VP-App-Locale"] = "de-DE"})
+  local data = JSON(resp):dictionary()
+  local payload = data["payload"]
+
+  if not payload then
+    error("aktuellekurse: keine Payload in der Antwort. "
+        .."Möglicherweise wird ein anderer initialer Endpunkt benötigt.")
+  end
+
+  g_holdings = payload  -- cache for next refresh
+
+  local securities = {}
+  for _, pos in ipairs(payload["positionen"] or {}) do
+    local kd     = pos["kursdaten"] or {}
+    local boerse = kd["kursAktuellBoerse"] or {}
+    -- langbezeichnung1/2 are the two halves of the fund's full name
+    local name = ((pos["langbezeichnung1"] or "") .. " " .. (pos["langbezeichnung2"] or "")):match("^%s*(.-)%s*$")
+    securities[#securities+1] = {
+      name          = name,
+      isin          = pos["isin"] or "",
+      wkn           = pos["wkn"] or "",
+      quantity      = pos["stueckNominal"] or 0,
+      amount        = pos["kurswertEUR"] or 0,         -- current market value in EUR
+      currency      = pos["gattungsWaehrung"] or "EUR",
+      purchasePrice = pos["durchschnittlicherEinstandskurs"] or 0,
+      price         = kd["kursAktuell"] or 0,
+      exchangeName  = boerse["langbezeichnung"] or "",
+    }
+  end
+
+  return {
+    balance    = payload["depotwert"] or 0,  -- total depot value in EUR
+    currency   = "EUR",
+    securities = securities,
+  }
+end
+
+function EndSession()
+  g_jwt      = nil
+  g_phase    = 0
+  g_depot    = nil
+  g_holdings = nil
+end
