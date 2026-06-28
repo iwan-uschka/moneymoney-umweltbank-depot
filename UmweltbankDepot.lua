@@ -960,10 +960,8 @@ function RefreshAccount(account, since)
   for _, pos in ipairs(payload["positionen"] or {}) do
     local kd     = pos["kursdaten"] or {}
     local boerse = kd["kursAktuellBoerse"] or {}
-    -- langbezeichnung1/2 are the two halves of the fund's full name
-    local name = ((pos["langbezeichnung1"] or "") .. " " .. (pos["langbezeichnung2"] or "")):match("^%s*(.-)%s*$")
     securities[#securities+1] = {
-      name          = name,
+      name          = pos["kurzbezeichnung"] or "",
       isin          = pos["isin"] or "",
       wkn           = pos["wkn"] or "",
       quantity      = pos["stueckNominal"] or 0,
