@@ -50,28 +50,6 @@ local AKTUELL_ENDPOINT     = BASE .. "/services_cloud/portal/proxy-gateway/servi
 -- ─────────────────────────────────────────────────────────────────────────────
 -- GF(256) – Galois Field arithmetic
 -- ─────────────────────────────────────────────────────────────────────────────
---
--- A "Galois Field" GF(2^8) is a set of 256 elements (the integers 0-255) with
--- addition and multiplication operations that are closed (results always stay in
--- 0-255) and obey the usual algebraic laws.
---
--- Addition in GF(256) is simple XOR (no carry between bits).
---
--- Multiplication is trickier because x*y can exceed 255. To keep results inside
--- the field, results are reduced by a "primitive polynomial" – in this case
---   x^8 + x^4 + x^3 + x^2 + 1  (binary 1_0001_1101 = 0x11D)
--- Analogous to modular arithmetic: when a product overflows, XOR with (i.e.
--- subtract) the polynomial to bring it back below 256.
---
--- EXP and LOG tables are pre-built to make multiplication fast, analogous to
--- natural logarithm tables.  Instead of computing a*b directly, the result is:
---   GF_EXP[ (GF_LOG[a] + GF_LOG[b]) mod 255 ]
--- This turns 8 XOR steps into 2 table lookups and 1 addition.
---
--- GF_EXP[i] = 2^i in GF(256), where 2 is the primitive element (generator).
--- GF_LOG[v] = the exponent i such that 2^i = v.
--- We extend EXP to 511 entries so that (log_a + log_b) never needs a conditional
--- modulo when the sum is between 255 and 510.
 
 local GF_EXP, GF_LOG = {}, {}
 do
@@ -95,21 +73,8 @@ local function gf_mul(a, b)
 end
 
 -- ─────────────────────────────────────────────────────────────────────────────
--- Reed-Solomon error correction encoder
+-- Reed-Solomon error correction encoder (EC Level L, ~7% recovery)
 -- ─────────────────────────────────────────────────────────────────────────────
---
--- Reed-Solomon adds n_ec "check bytes" to a block of data bytes.  A QR decoder
--- can use those check bytes to detect and correct errors (damaged or unreadable
--- modules) – EC Level L tolerates up to ~7% of the symbol being destroyed.
---
--- Mathematically, RS treats the data as the coefficients of a polynomial D(x)
--- and computes the remainder of D(x) * x^n_ec divided by a generator polynomial
--- G(x).  That remainder IS the error-correction codewords.
---
--- The generator polynomial is the product of linear factors over GF(256):
---   G(x) = (x - α^0)(x - α^1)...(x - α^(n_ec-1))
--- where α = 2 (the primitive element).  rs_generator builds G(x) iteratively by
--- multiplying in one factor at a time.
 
 local function rs_generator(n)
   local g = {1}  -- start with the polynomial "1"
@@ -149,26 +114,8 @@ local function rs_encode(data, n_ec)
 end
 
 -- ─────────────────────────────────────────────────────────────────────────────
--- QR code capacity tables for Error Correction Level L ("Low", ~7% recovery)
+-- QR capacity tables, EC Level L: {ec_cw_per_block, g1_count, g1_data_cw, g2_count, g2_data_cw}
 -- ─────────────────────────────────────────────────────────────────────────────
---
--- Each QR version (= size tier) splits its codewords into one or two groups of
--- blocks.  Each block gets its own RS error correction independently.
---
--- Using multiple smaller blocks is better than one giant block: if a contiguous
--- region is damaged, no single block loses more data than RS can handle.
---
--- Layout of EC_L[version]:
---   { ec_per_block,                -- RS check bytes added to every block
---     group1_block_count, group1_data_cw_per_block,   -- first group
---     group2_block_count, group2_data_cw_per_block }  -- second group (0 if unused)
---
--- Group 2 blocks carry exactly one extra data codeword when the total count
--- can't be divided evenly among identical blocks.
---
--- Example – version 20:
---   {28, 3, 107, 5, 108} → 3 blocks × 107 data cw  +  5 blocks × 108 data cw
---   Each block also gets 28 RS check bytes → 8 blocks × 135 total cw each.
 
 local EC_L = {
   [1]  = { 7, 1, 19, 0,  0},  [2]  = {10, 1, 34, 0,  0},
@@ -267,7 +214,7 @@ end
 -- surrounded by a 1-module white separator.  Three are placed in the corners;
 -- the missing fourth corner uniquely identifies the symbol's orientation.
 -- The distinctive concentric-square pattern is detectable at any scale and angle.
-local function place_finder(m, r0, c0)
+local function place_finder(m, n, r0, c0)
   for dr = -1, 7 do
     for dc = -1, 7 do
       local val
@@ -282,7 +229,7 @@ local function place_finder(m, r0, c0)
       end
       local r, c = r0+dr, c0+dc
       -- Guard against the top-left finder's separator going to row -1
-      if m[r] then m[r][c] = val end
+      if m[r] and c >= 0 and c < n then m[r][c] = val end
     end
   end
 end
@@ -339,18 +286,7 @@ local function version_info_word(ver)
   return (ver << 12) | (d & 0xFFF)
 end
 
--- Writes the 15-bit format info word into TWO copies within the matrix.
--- Two copies ensure that damage to one doesn't prevent decoding.
---
---   Copy 1: L-shaped strip adjacent to the top-left finder.
---     • Row 8, cols 0-5 then 7-8  (horizontal arm; col 6 is the timing pattern)
---     • Col 8, rows 7-0            (vertical arm; row 6 is the timing pattern)
---   Copy 2: mirrored at the top-right and bottom-left finders.
---     • Row 8, cols n-1 down to n-8  (top-right, same bit order as Copy 1)
---     • Col 8, rows n-7 up to n-1   (bottom-left, continues the same sequence)
---
--- Bit order: f14 (MSB) placed first at (8,0); f0 (LSB) placed last at (0,8).
--- The same MSB-first order applies to Copy 2.
+-- Writes the 15-bit format info word into two copies: L-strip at top-left, mirrored at top-right and bottom-left.
 local function place_format(m, n, fi)
   local bits = {}
   for b = 14, 0, -1 do bits[#bits+1] = (fi >> b) & 1 end
@@ -469,9 +405,9 @@ local function build_matrix(ver, codewords)
   local m = new_mat(n)  -- nil = unassigned (available for data)
 
   -- ── Finder patterns (three corners) ─────────────────────────────────────
-  place_finder(m, 0,   0)    -- top-left
-  place_finder(m, 0,   n-7)  -- top-right
-  place_finder(m, n-7, 0)    -- bottom-left
+  place_finder(m, n, 0,   0)    -- top-left
+  place_finder(m, n, 0,   n-7)  -- top-right
+  place_finder(m, n, n-7, 0)    -- bottom-left
   -- (no bottom-right finder – the empty corner identifies symbol orientation)
 
   -- ── Timing patterns ──────────────────────────────────────────────────────
@@ -548,16 +484,8 @@ local function build_matrix(ver, codewords)
 end
 
 -- ─────────────────────────────────────────────────────────────────────────────
--- Masking
+-- Masking: XOR data modules with one of 8 patterns; keep the lowest-penalty result.
 -- ─────────────────────────────────────────────────────────────────────────────
---
--- Masking XORs each DATA module with a boolean formula.  The goal is to break
--- up regularities that could confuse a decoder – long runs of the same colour,
--- 2×2 solid blocks, and patterns resembling finder symbols.
---
--- The spec defines 8 candidate mask patterns (indexed 0-7).  We try all eight,
--- evaluate each with a penalty score, and keep the one with the lowest score.
--- Function modules are NEVER masked; their fixed values must remain intact.
 
 local MASK_FN = {
   function(r,c) return (r+c)%2==0 end,
@@ -623,7 +551,7 @@ local function penalty(m, n)
   for r = 0, n-1 do for c = 0, n-1 do if m[r][c]==1 then dark=dark+1 end end end
   local pct = dark*100//(n*n)
   -- Distance to the nearest multiple-of-5 on both sides of 50%, divided by 5, ×10
-  p = p + math.min(math.abs(pct - pct%5 - 50)//5, math.abs((pct-pct%5+5) - 50)//5) * 10
+  p = p + math.abs(pct - 50) // 5 * 10
 
   return p
 end
@@ -655,12 +583,9 @@ local function qr_matrix(text)
   local best_m, best_p = nil, math.huge
   for mask = 0, 7 do
     local mm = apply_mask(m_base, n, ver, mask)
-    local fi = format_info_word(mask)
-    local mc = new_mat(n)
-    for r=0,n-1 do for c=0,n-1 do mc[r][c]=mm[r][c] end end
-    place_format(mc, n, fi)
-    local p = penalty(mc, n)
-    if p < best_p then best_m, best_p = mc, p end
+    place_format(mm, n, format_info_word(mask))
+    local p = penalty(mm, n)
+    if p < best_p then best_m, best_p = mm, p end
   end
 
   -- Version information (two 6×3 rectangles, only for QR code version 7 and above).
@@ -678,24 +603,8 @@ local function qr_matrix(text)
 end
 
 -- ─────────────────────────────────────────────────────────────────────────────
--- PNG encoding (8-bit grayscale, uncompressed DEFLATE)
+-- PNG encoding (8-bit grayscale, DEFLATE store mode — no compression lib available)
 -- ─────────────────────────────────────────────────────────────────────────────
---
--- MoneyMoney's Lua environment has no compression library, so DEFLATE's
--- "store" mode (BTYPE = 00), which wraps raw data in 5-byte block headers
--- without any compression.  This is legal per the DEFLATE and zlib specs and
--- produces a valid PNG file – just a larger one than a compressed encoder would.
---
--- PNG chunk structure: 4-byte length | 4-byte type | data | 4-byte CRC32
--- CRC32 covers the type and data fields.
---
--- The IDAT chunk contains a zlib stream (0x78 0x01 header + DEFLATE blocks +
--- Adler-32 checksum trailer).  Adler-32 is the zlib checksum; CRC32 is used
--- separately for the PNG chunk wrapper.
---
--- Each scanline is preceded by a 1-byte filter selector.  We use filter 0
--- (None) on every row, which means "copy this row as-is" – the simplest and
--- correct choice for a bi-level (black/white) grayscale image.
 
 local CRC_TABLE = {}
 do
@@ -777,20 +686,19 @@ end
 -- ─────────────────────────────────────────────────────────────────────────────
 
 local function qr_png(text, scale, quiet)
-  -- scale: each QR module becomes scale×scale pixels (4 = ~80px for version 1)
-  -- quiet: white border in modules; the spec requires at least 4 on every side
   scale = scale or 4
   quiet = quiet or 4
   local mat, n = qr_matrix(text)
   local sz = (n + 2*quiet) * scale
+  local dark_px  = string.rep("\0",   scale)
+  local light_px = string.rep("\xFF", scale)
   local pixel_parts = {}
   for row = -quiet, n+quiet-1 do
     local row_pixels = {}
     for col = -quiet, n+quiet-1 do
-      -- Modules outside the QR matrix (quiet zone) are white.
       local is_dark = (row >= 0 and row < n and col >= 0 and col < n
                        and mat[row] and mat[row][col] == 1)
-      row_pixels[#row_pixels+1] = string.rep(is_dark and "\0" or "\xFF", scale)
+      row_pixels[#row_pixels+1] = is_dark and dark_px or light_px
     end
     local row_str = table.concat(row_pixels)
     -- Repeat each pixel-row `scale` times to produce square modules.
@@ -825,7 +733,6 @@ end
 
 local g_jwt      = nil   -- QR challenge JWT (used to poll status and call qr-login)
 local g_phase    = 0     -- counts how many times InitializeSession2 has been called
-local g_depot    = nil   -- depot account object from konto/group (currently unused)
 local g_holdings = nil   -- last aktuellekurse response payload; reused as next request body
 
 -- ─────────────────────────────────────────────────────────────────────────────
@@ -857,14 +764,14 @@ function InitializeSession2(protocol, bank, username, reserved, password)
     -- recognise the QR code, so the extension fails immediately with actionable instructions.
     local ui_resp = connection:get(QR_INIT_UI_ENDPOINT)
     local ui_data = JSON(ui_resp):dictionary()
-    if ui_data["qrCodeLoginAllowed"] == false then
+    if ui_data["qrCodeLoginAllowed"] ~= true then
       error("QR-Code Login ist noch nicht aktiviert.\n\n"
           .. "Bitte öffnen Sie banking.umweltbank.de im Browser, melden Sie sich "
           .. "an und aktivieren Sie den QR-Code Login unter Einstellungen → "
           .. "SecureGo plus. Danach kann diese Erweiterung genutzt werden.")
     end
 
-    local resp = connection:post(QR_INIT_CODE_ENDPOINT, "", "application/json")
+    local resp = connection:post(QR_INIT_CODE_ENDPOINT, "{}", "application/json")
     local data = JSON(resp):dictionary()
     -- The JWT encodes the login challenge; SecureGo plus decodes it and signs
     -- a confirmation that travels back to the server via the push notification.
@@ -912,7 +819,7 @@ function InitializeSession2(protocol, bank, username, reserved, password)
 
     -- qr-login advances the CAS authentication state to "completed".
     -- The server checks that the JWT was genuinely approved by SecureGo plus.
-    local lr = connection:request("POST", QR_LOGIN_ENDPOINT, "", "application/json",
+    local lr = connection:request("POST", QR_LOGIN_ENDPOINT, "{}", "application/json",
       {["Authorization"] = "Bearer " .. g_jwt})
     local ld = JSON(lr):dictionary()
     local apr = ld["authenticationProcessResponse"]
@@ -935,49 +842,20 @@ function InitializeSession2(protocol, bank, username, reserved, password)
       error("QR-Authentifizierung nicht abgeschlossen.")
     end
 
-    -- consent/execution finalises CAS and triggers the portal OAuth redirect chain:
-    --   CAS → /portal-oauth/login?code=... → /oauth/authorize?... → /portal/login
-    -- MoneyMoney's Connection() (NSURLSession-based) follows all HTTP redirects
-    -- automatically, so intermediate Location headers are not accessible.
-    local _, _, _, _, ch = connection:request("POST", CONSENT_ENDPOINT,
-      '{"useBrowserDetection":false}', "application/json")
+    -- Finalize CAS; MoneyMoney follows all redirects automatically.
+    connection:request("POST", CONSENT_ENDPOINT, '{"useBrowserDetection":false}', "application/json")
 
+    -- With CAS satisfied, oauth/authorize returns a 302 to REDIRECT_URI with the auth code.
     local portal_code = nil
-
-    -- Attempt A: if Connection() stopped at the first 302 (unlikely but possible
-    -- depending on MoneyMoney version), ch will contain a Location header with the
-    -- portal-oauth/login URL and its auth code.
-    if ch then
-      local loc = ch["Location"] or ch["location"]
-      if loc then
-        local _, _, _, _, plh = connection:request("GET", loc, nil, nil)
-        if plh then
-          local aloc = plh["Location"] or plh["location"]
-          if aloc then
-            local _, _, _, _, ahl = connection:request("GET", aloc, nil, nil)
-            if ahl then
-              local floc = ahl["Location"] or ahl["location"]
-              if floc then portal_code = floc:match("[?&]code=([^&]+)") end
-            end
-          end
-        end
-      end
-    end
-
-    -- Attempt B: now that CAS is satisfied, calling oauth/authorize directly
-    -- should return a 302 to REDIRECT_URI with the portal auth code in the URL.
-    -- This bypasses the multi-step redirect chain entirely.
-    if not portal_code then
-      local state = uuid()
-      local auth_url = AUTHORIZE_ENDPOINT
-          .. "?redirect_uri=" .. url_encode(REDIRECT_URI)
-          .. "&response_type=code&state=" .. state
-          .. "&client_id=online-banking"
-      local _, _, _, _, ah = connection:request("GET", auth_url, nil, nil)
-      if ah then
-        local fl = ah["Location"] or ah["location"]
-        if fl then portal_code = fl:match("[?&]code=([^&]+)") end
-      end
+    local state = uuid()
+    local auth_url = AUTHORIZE_ENDPOINT
+        .. "?redirect_uri=" .. url_encode(REDIRECT_URI)
+        .. "&response_type=code&state=" .. state
+        .. "&client_id=online-banking"
+    local _, _, _, _, ah = connection:request("GET", auth_url, nil, nil)
+    if ah then
+      local fl = ah["Location"] or ah["location"]
+      if fl then portal_code = fl:match("[?&]code=([^&]+)") end
     end
 
     if not portal_code then
@@ -1002,6 +880,8 @@ function InitializeSession2(protocol, bank, username, reserved, password)
       error("OAuth Token-Austausch fehlgeschlagen: "
           .. (tok_data["error_description"] or tok_data["error"]))
     end
+  else
+    error("InitializeSession2 unerwartet in Phase " .. g_phase .. " aufgerufen.")
   end
 end
 
@@ -1013,7 +893,6 @@ function ListAccounts(knownAccounts)
   for _, grp in ipairs(data["groups"] or {}) do
     for _, konto in ipairs(grp["konten"] or {}) do
       if konto["art"] == "DEPOT" then
-        g_depot = konto
         accounts[#accounts+1] = {
           name          = konto["bezeichnung"] or "Umweltbank Depot",
           accountNumber = konto["kontonummer"] or konto["iban"] or "",
@@ -1095,6 +974,5 @@ end
 function EndSession()
   g_jwt      = nil
   g_phase    = 0
-  g_depot    = nil
   g_holdings = nil
 end
