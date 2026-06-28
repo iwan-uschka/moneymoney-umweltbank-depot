@@ -550,8 +550,10 @@ local function penalty(m, n)
   local dark = 0
   for r = 0, n-1 do for c = 0, n-1 do if m[r][c]==1 then dark=dark+1 end end end
   local pct = dark*100//(n*n)
-  -- Distance to the nearest multiple-of-5 on both sides of 50%, divided by 5, ×10
-  p = p + math.abs(pct - 50) // 5 * 10
+  -- ISO 18004 Rule 4: find the two nearest multiples of 5 on either side of pct,
+  -- compute each one's distance from 50%, take the minimum, scale by 10.
+  local snap = pct - pct % 5
+  p = p + math.min(math.abs(snap - 50), math.abs(snap + 5 - 50)) // 5 * 10
 
   return p
 end
@@ -810,6 +812,9 @@ function InitializeSession2(protocol, bank, username, reserved, password)
         -- The JWT has a short TTL; if the user takes too long to open SecureGo plus
         -- the server invalidates it before they can scan.
         error("QR-Code abgelaufen. Bitte die Anmeldung neu starten und den Code innerhalb von 3 Minuten scannen.")
+      elseif state ~= nil then
+        -- Unknown terminal state — fail immediately rather than burning the full timeout.
+        error("QR-Authentifizierung: unbekannter Status '" .. state .. "'. Bitte erneut versuchen.")
       end
       MM.sleep(2000)
     end
@@ -904,6 +909,12 @@ function ListAccounts(knownAccounts)
   end
   if #accounts == 0 then
     error("Kein Depot-Konto in konto/group gefunden (art == 'DEPOT').")
+  end
+  if #accounts > 1 then
+    -- aktuellekurse is session-scoped; the request carries no per-account selector,
+    -- so RefreshAccount would return identical holdings for every depot. Return only
+    -- the first to avoid silently duplicating positions across multiple accounts.
+    return {accounts[1]}
   end
   return accounts
 end
