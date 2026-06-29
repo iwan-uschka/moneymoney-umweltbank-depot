@@ -24,15 +24,24 @@ local QR_INIT_CODE_ENDPOINT = BASE .. "/services_auth/auth-qr-service/api/init-q
 local QR_STATUS_ENDPOINT    = BASE .. "/services_auth/auth-qr-service/api/status"
 local QR_LOGIN_ENDPOINT     = BASE .. "/services_auth/auth-backend/api/authentication/qr-login"
 
+-- ── CAS session initiation ───────────────────────────────────────────────────
+-- GET CAS_AUTHORIZE_ENDPOINT issues a 302 that sets the CAS_SESSION cookie.
+-- auth-qr-service rejects all requests without it ("Cookie 'CAS_SESSION' not found").
+-- client_id and claims are fixed values the portal always sends; state/nonce are random.
+local CAS_AUTHORIZE_ENDPOINT = BASE .. "/services_auth/oauth2/authorize"
+local CAS_REDIRECT_URI       = BASE .. "/services_cloud/portal/portal-oauth/login"
+local CAS_CLAIMS             = "%7B%22id_token%22:%7B%22https://cas.bankenit.de/id/type%22:%7B%22essential%22:true%7D,%22https://cas.bankenit.de/id/tan_status%22:%7B%22essential%22:false%7D,%22birthdate%22:%7B%22essential%22:true%7D,%22https://cas.bankenit.de/id/salutation%22:%7B%22essential%22:true%7D,%22https://cas.bankenit.de/id/version%22:%7B%22essential%22:true%7D,%22https://cas.bankenit.de/id/allowed_scopes%22:%7B%22essential%22:true%7D,%22given_name%22:%7B%22essential%22:true%7D,%22https://cas.bankenit.de/id/bankKunde%22:%7B%22essential%22:true%7D,%22acr%22:%7B%22essential%22:true,%22values%22:%5B%22onlinebanking_psd2%22,%22onlinebanking_pin%22%5D%7D,%22https://cas.bankenit.de/id/pin_status%22:%7B%22essential%22:false%7D,%22https://cas.bankenit.de/id/last_login%22:%7B%22essential%22:true%7D,%22family_name%22:%7B%22essential%22:true%7D,%22email%22:%7B%22essential%22:true%7D,%22jti%22:%7B%22essential%22:true%7D,%22https://cas.bankenit.de/id/vertriebskunden_id%22:%7B%22essential%22:true%7D,%22sid%22:%7B%22essential%22:true%7D%7D%7D"
+
 -- ── Portal OAuth endpoints ───────────────────────────────────────────────────
--- CONSENT_ENDPOINT  : completes the CAS login and kicks off the portal OAuth
---                     redirect chain (CAS → portal-oauth/login → oauth/authorize
---                     → portal/login).  MoneyMoney follows all redirects
---                     automatically, so intermediate Location headers are not accessible.
--- AUTHORIZE_ENDPOINT: the portal's own OAuth 2.0 authorization endpoint. Calling it
---                     directly (after CAS is already satisfied) short-circuits the
---                     redirect chain and gives us the auth code in its Location header.
--- TOKEN_ENDPOINT    : exchanges the auth code for an access_token cookie.
+-- CONSENT_ENDPOINT  : completes the CAS login and returns the CAS callback parameters
+--                     (code, state, iss) that portal-oauth/login must receive.
+-- AUTHORIZE_ENDPOINT: the portal's own OAuth 2.0 authorization endpoint.  Always
+--                     responds with a 302 redirect to REDIRECT_URI?code=<portal_code>.
+--                     MoneyMoney follows all redirects automatically, so the portal
+--                     code is only ever visible in the MoneyMoney log — not from Lua.
+-- TOKEN_ENDPOINT    : exchanges the portal code for access_token/refresh_token.
+--                     Tokens may be returned as HttpOnly cookies (sent automatically
+--                     by MoneyMoney's cookie jar) or as JSON (stored in g_access_token).
 -- REDIRECT_URI      : where the portal expects the auth code to land. Must match
 --                     exactly what the portal registered.
 local CONSENT_ENDPOINT   = BASE .. "/services_auth/auth-backend/api/consent/execution"
@@ -41,11 +50,12 @@ local TOKEN_ENDPOINT     = BASE .. "/services_cloud/portal/portal-oauth/oauth/to
 local REDIRECT_URI       = BASE .. "/services_cloud/portal/login"
 
 -- ── Data endpoints ───────────────────────────────────────────────────────────
--- KONTO_GROUP_ENDPOINT: lists all accounts grouped by type; filtered for art == "DEPOT".
--- AKTUELL_ENDPOINT    : "aktuellekurse" = "current prices". Takes the previous holdings
---                       structure as the request body and returns it with refreshed prices.
+-- KONTO_GROUP_ENDPOINT : lists all accounts grouped by type; filtered for art == "DEPOT".
+-- DEPOTS_ENDPOINT      : GET depots/{depotNummer} — returns positions with last-trading-day
+--                        prices (kursAktuell). depotwert is always 0; sum kurswertEUR instead.
 local KONTO_GROUP_ENDPOINT = BASE .. "/services_cloud/portal/proxy-gateway/serviceproxy/konto-service/v2/konto/group"
-local AKTUELL_ENDPOINT     = BASE .. "/services_cloud/portal/proxy-gateway/serviceproxy/wporder-bestand-service-v1/rest/de.fiduciagad.dzwp.wporder.bestand.v1.bestand.BestandApi/aktuellekurse"
+local _BESTAND_BASE   = BASE .. "/services_cloud/portal/proxy-gateway/serviceproxy/wporder-bestand-service-v1/rest/de.fiduciagad.dzwp.wporder.bestand.v1.bestand.BestandApi"
+local DEPOTS_ENDPOINT = _BESTAND_BASE .. "/depots/"   -- append depotNummer at runtime
 
 -- ─────────────────────────────────────────────────────────────────────────────
 -- GF(256) – Galois Field arithmetic
@@ -733,9 +743,9 @@ end
 -- Session state (module-level; persists across InitializeSession2 phases)
 -- ─────────────────────────────────────────────────────────────────────────────
 
-local g_jwt      = nil   -- QR challenge JWT (used to poll status and call qr-login)
-local g_phase    = 0     -- counts how many times InitializeSession2 has been called
-local g_holdings = nil   -- last aktuellekurse response payload; reused as next request body
+local g_jwt          = nil   -- QR challenge JWT (used to poll status and call qr-login)
+local g_phase        = 0     -- counts how many times InitializeSession2 has been called
+local g_access_token = nil   -- portal access_token, set when TOKEN_ENDPOINT returns JSON (not cookies)
 
 -- ─────────────────────────────────────────────────────────────────────────────
 -- MoneyMoney extension
@@ -748,8 +758,10 @@ WebBanking {
   description = "Umweltbank Depot-Konten via QR-Code / SecureGo plus",
 }
 
-function SupportsBank(protocol, bank)
-  return protocol == ProtocolWebBanking and bank.name == "Umweltbank Depot"
+local connection = Connection()
+
+function SupportsBank(protocol, bankCode)
+  return protocol == ProtocolWebBanking and bankCode == "Umweltbank Depot"
 end
 
 -- MoneyMoney calls InitializeSession2 once to show the challenge, then again
@@ -759,21 +771,27 @@ function InitializeSession2(protocol, bank, username, reserved, password)
 
   -- ── Phase 1: start a CAS session and emit the QR code challenge ──────────
   if g_phase == 1 then
-    -- init-ui sets the CAS_SESSION cookie in Connection()'s cookie jar.
-    -- Without it, init-qr-code returns "Session not found".
-    -- It also returns qrCodeLoginAllowed, which tells us whether the user has
-    -- ever opted into QR login in the browser.  If not, SecureGo plus won't
-    -- recognise the QR code, so the extension fails immediately with actionable instructions.
+    -- Route through portal-oauth so it generates and stores the internal state
+    -- it will verify when portal-oauth/login is called in phase 2.
+    -- The redirect chain (portal-oauth → CAS → auth-frontend) also sets CAS_SESSION.
+    connection:get(AUTHORIZE_ENDPOINT
+      .. "?response_type=code&client_id=online-banking"
+      .. "&redirect_uri=" .. url_encode(REDIRECT_URI))
+
+    -- init-ui returns branding config for the QR login screen.
     local ui_resp = connection:get(QR_INIT_UI_ENDPOINT)
     local ui_data = JSON(ui_resp):dictionary()
-    if ui_data["qrCodeLoginAllowed"] ~= true then
+    if ui_data["qrCodeLoginAllowed"] == false then
       error("QR-Code Login ist noch nicht aktiviert.\n\n"
           .. "Bitte öffnen Sie banking.umweltbank.de im Browser, melden Sie sich "
           .. "an und aktivieren Sie den QR-Code Login unter Einstellungen → "
           .. "SecureGo plus. Danach kann diese Erweiterung genutzt werden.")
     end
 
-    local resp = connection:post(QR_INIT_CODE_ENDPOINT, "{}", "application/json")
+    local resp = connection:request("POST", QR_INIT_CODE_ENDPOINT, "", "", {
+      ["Origin"] = BASE,
+      ["Referer"] = BASE .. "/",
+    })
     local data = JSON(resp):dictionary()
     -- The JWT encodes the login challenge; SecureGo plus decodes it and signs
     -- a confirmation that travels back to the server via the push notification.
@@ -785,7 +803,8 @@ function InitializeSession2(protocol, bank, username, reserved, password)
     -- Encode the JWT as a QR image and hand it to MoneyMoney as an image challenge.
     -- MoneyMoney will display the PNG to the user and call us again (phase 2)
     -- after they click OK.
-    local png = qr_png(g_jwt, 4, 4)
+    local qr_url = string.gsub(ui_data["qrCodeUrl"], "{JWT}", g_jwt)
+    local png = qr_png(qr_url, 4, 4)
     return {
       title     = "Umweltbank QR-Login",
       challenge = png,
@@ -847,51 +866,101 @@ function InitializeSession2(protocol, bank, username, reserved, password)
       error("QR-Authentifizierung nicht abgeschlossen.")
     end
 
-    -- Finalize CAS; MoneyMoney follows all redirects automatically.
-    connection:request("POST", CONSENT_ENDPOINT, '{"useBrowserDetection":false}', "application/json")
-
-    -- With CAS satisfied, oauth/authorize returns a 302 to REDIRECT_URI with the auth code.
-    local portal_code = nil
-    local state = uuid()
-    local auth_url = AUTHORIZE_ENDPOINT
-        .. "?redirect_uri=" .. url_encode(REDIRECT_URI)
-        .. "&response_type=code&state=" .. state
-        .. "&client_id=online-banking"
-    local _, _, _, _, ah = connection:request("GET", auth_url, nil, nil)
-    if ah then
-      local fl = ah["Location"] or ah["location"]
-      if fl then portal_code = fl:match("[?&]code=([^&]+)") end
+    -- Finalize CAS.  The response body contains the OAuth callback parameters
+    -- (code, state, iss) the CAS server would normally deliver via redirect to
+    -- CAS_REDIRECT_URI.  We extract them and call that endpoint ourselves.
+    local consent_resp = connection:request("POST", CONSENT_ENDPOINT, '{"useBrowserDetection":false}', "application/json")
+    local consent_data = JSON(consent_resp):dictionary()
+    local cr = consent_data["postAuthenticationProcessResponse"]
+    cr = cr and cr["resultOfCurrentPostAuthenticationProcessStep"]
+    local param_str = cr and cr["parameter"]
+    if not param_str then
+      error("Consent fehlgeschlagen: kein Weiterleitungsparameter erhalten.")
     end
 
+    -- Establish the portal session: portal-oauth/login validates the CAS code and
+    -- sets portal session cookies.  MoneyMoney follows all redirects automatically:
+    --   portal-oauth/login → portal-oauth/oauth/authorize → portal/login?code=X → HTML
+    -- The portal code is only in the intermediate redirect URL and is not accessible
+    -- from Lua (MoneyMoney exposes no API for intermediate redirect URLs).
+    -- The code IS visible in the MoneyMoney log window.  We show a challenge asking
+    -- the user to copy it so that we can call TOKEN_ENDPOINT in phase 3.
+    connection:get(CAS_REDIRECT_URI .. "?" .. param_str)
+
+    -- A challenge image is required for MoneyMoney to display the text-input field.
+    local hint_png = make_png(string.rep("\xFF", 200 * 40), 200, 40)
+    return {
+      title     = "Umweltbank – Portal-Code eingeben",
+      challenge = hint_png,
+      label     = "Protokoll öffnen (Hilfe → Protokoll anzeigen),"
+                .. " letzten »portal/login?code=…« finden,"
+                .. " langen Wert nach »code=« kopieren und hier einfügen:",
+    }
+  elseif g_phase == 3 then
+    -- ── Phase 3: exchange the portal code entered by the user ─────────────────
+    -- MoneyMoney passes challenge input as password; reserved is the stored account
+    -- password. Try both in case the assignment is reversed on some MM versions.
+    local function dump(v, depth)
+      depth = depth or 0
+      if type(v) ~= "table" or depth > 2 then return tostring(v) end
+      local parts = {}
+      for k, w in pairs(v) do
+        table.insert(parts, tostring(k) .. "=" .. dump(w, depth + 1))
+      end
+      return "{" .. table.concat(parts, ", ") .. "}"
+    end
+
+    local portal_code
+    if type(password) == "string" and #password >= 10 then
+      portal_code = password
+    elseif type(reserved) == "string" and #reserved >= 10 then
+      portal_code = reserved
+    elseif type(reserved) == "table" and type(reserved[1]) == "string" and #reserved[1] >= 10 then
+      -- MoneyMoney passes challenge text input as reserved[1]
+      portal_code = reserved[1]
+    end
     if not portal_code then
-      error("Portal-OAuth fehlgeschlagen: Auth-Code nicht ermittelbar. "
-          .."Bitte einen GitHub-Issue mit diesem Fehler erstellen.")
+      error("Portal-Code nicht erhalten.\n"
+          .. "password: " .. type(password) .. " = " .. tostring(password) .. "\n"
+          .. "reserved: " .. dump(reserved) .. "\n\n"
+          .. "Bitte das Eingabefeld mit dem Code aus dem Protokoll befüllen.")
     end
+    -- Strip any leading/trailing whitespace the user might have accidentally added.
+    portal_code = portal_code:match("^%s*(.-)%s*$")
 
-    -- Exchange the portal auth code for an access_token.
-    -- The server sets access_token and refresh_token as HttpOnly cookies, making
-    -- them unreadable from Lua – Connection() stores and forwards them automatically
-    -- with every subsequent request to banking.umweltbank.de.
-    -- We still parse the response to catch failures early (e.g. expired or
-    -- already-used auth code) rather than seeing a silent auth error in ListAccounts.
     local tok_resp = connection:request("POST", TOKEN_ENDPOINT,
-      "code=" .. portal_code
-        .. "&grant_type=authorization_code"
+      "grant_type=authorization_code"
+        .. "&code=" .. portal_code
+        .. "&client_id=online-banking"
         .. "&redirect_uri=" .. url_encode(REDIRECT_URI),
-      "application/x-www-form-urlencoded",
-      {["X-VP-App-Locale"] = "de-DE"})
-    local tok_data = JSON(tok_resp):dictionary()
-    if tok_data["error"] then
-      error("OAuth Token-Austausch fehlgeschlagen: "
-          .. (tok_data["error_description"] or tok_data["error"]))
+      "application/x-www-form-urlencoded")
+    local tok_data = {}
+    local parse_ok = pcall(function() tok_data = JSON(tok_resp):dictionary() end)
+    if parse_ok and tok_data["access_token"] then
+      g_access_token = tok_data["access_token"]
+    elseif parse_ok and tok_data["error"] then
+      error("Token-Austausch fehlgeschlagen: "
+          .. (tok_data["error_description"] or tok_data["error"])
+          .. "\n\nBitte Browser-DevTools öffnen (F12 → Network), bei Umweltbank einloggen"
+          .. "\nund den POST zu /portal-oauth/oauth/token beobachten:"
+          .. "\n  – Request-Body: grant_type, code, client_id, redirect_uri"
+          .. "\n  – Response: JSON-Body und Set-Cookie-Header")
     end
+    -- If tok_data has neither field, TOKEN_ENDPOINT set HttpOnly cookies which
+    -- MoneyMoney's cookie jar will send automatically with subsequent requests.
   else
     error("InitializeSession2 unerwartet in Phase " .. g_phase .. " aufgerufen.")
   end
 end
 
+local function api_headers()
+  local h = {["X-VP-App-Locale"] = "de-DE"}
+  if g_access_token then h["Authorization"] = "Bearer " .. g_access_token end
+  return h
+end
+
 function ListAccounts(knownAccounts)
-  local resp = connection:get(KONTO_GROUP_ENDPOINT, {["X-VP-App-Locale"] = "de-DE"})
+  local resp = connection:get(KONTO_GROUP_ENDPOINT, api_headers())
   local data = JSON(resp):dictionary()
 
   local accounts = {}
@@ -899,10 +968,13 @@ function ListAccounts(knownAccounts)
     for _, konto in ipairs(grp["konten"] or {}) do
       if konto["art"] == "DEPOT" then
         accounts[#accounts+1] = {
-          name          = konto["bezeichnung"] or "Umweltbank Depot",
-          accountNumber = konto["kontonummer"] or konto["iban"] or "",
+          name          = konto["displayName"] or konto["bezeichnung"] or "Umweltbank Depot",
+          accountNumber = konto["businessIdent"] or konto["kontonummer"] or konto["iban"]
+                       or (konto["nummer"] and tostring(konto["nummer"])) or "",
           currency      = "EUR",
+          portfolio     = true,
           type          = AccountTypePortfolio,
+          ident         = konto["ident"],
         }
       end
     end
@@ -920,68 +992,46 @@ function ListAccounts(knownAccounts)
 end
 
 function RefreshAccount(account, since)
-  -- aktuellekurse ("current prices") is a stateful endpoint: it takes the
-  -- current holdings structure as the request body and returns the same
-  -- structure with refreshed market prices.
-  --
-  -- On the first call g_holdings is nil, so an empty positionen list is sent.
-  -- The server is expected to populate it from the actual account state.
-  -- If it refuses (returns no payload), a separate initial-holdings endpoint
-  -- is likely needed – the error below surfaces this for investigation.
-  --
-  -- On subsequent calls the previous response payload is reused as the new
-  -- request body, which keeps depot tranche metadata intact.
-  local req_body
-  if g_holdings then
-    req_body = JSON:encode(g_holdings)
-  else
-    req_body = '{"depotwert":0,"entwicklungSeitEinstandBetrag":0,'
-      .. '"entwicklungSeitEinstandProzent":0,"einstandsDepotwert":0,'
-      .. '"entwicklungSeitEinstandAllePositionenEUR":0,'
-      .. '"kurswertBewertetePositionen":0,"anzahlBewerteteDepotpositionen":0,'
-      .. '"anzahlVerarbeiteteDepotpositionen":0,"depotart":"DEFAULT",'
-      .. '"positionen":[]}'
-  end
+  local depot_nr = account and account.accountNumber or ""
 
-  local resp = connection:request(
-    "POST", AKTUELL_ENDPOINT, req_body, "application/json",
-    {["X-VP-App-Locale"] = "de-DE"})
-  local data = JSON(resp):dictionary()
+  -- GET depots/{nr} returns positions with last-trading-day prices (kursAktuell).
+  -- depotwert is always 0 from the API; we sum kurswertEUR across positions instead.
+  local resp    = connection:get(DEPOTS_ENDPOINT .. depot_nr, api_headers())
+  local data    = JSON(resp):dictionary()
   local payload = data["payload"]
-
   if not payload then
-    error("aktuellekurse: keine Payload in der Antwort. "
-        .."Möglicherweise wird ein anderer initialer Endpunkt benötigt.")
+    error("GET depots/" .. depot_nr .. ": keine Payload in der Antwort.")
   end
 
-  g_holdings = payload  -- cache for next refresh
-
-  local securities = {}
+  local securities  = {}
+  local total_value = 0
   for _, pos in ipairs(payload["positionen"] or {}) do
     local kd     = pos["kursdaten"] or {}
     local boerse = kd["kursAktuellBoerse"] or {}
+    local val    = tonumber(pos["kurswertEUR"]) or 0
+    total_value  = total_value + val
     securities[#securities+1] = {
-      name          = pos["kurzbezeichnung"] or "",
-      isin          = pos["isin"] or "",
-      wkn           = pos["wkn"] or "",
-      quantity      = pos["stueckNominal"] or 0,
-      amount        = pos["kurswertEUR"] or 0,         -- current market value in EUR
-      currency      = pos["gattungsWaehrung"] or "EUR",
-      purchasePrice = pos["durchschnittlicherEinstandskurs"] or 0,
-      price         = kd["kursAktuell"] or 0,
-      exchangeName  = boerse["langbezeichnung"] or "",
+      name          = tostring(pos["kurzbezeichnung"] or ""),
+      isin          = tostring(pos["isin"] or ""),
+      wkn           = tostring(pos["wkn"] or ""),
+      quantity      = tonumber(pos["stueckNominal"]) or 0,
+      amount        = val,
+      currency      = tostring(pos["gattungsWaehrung"] or "EUR"),
+      purchasePrice = tonumber(pos["durchschnittlicherEinstandskurs"]) or 0,
+      price         = tonumber(kd["kursAktuell"]) or 0,
+      exchangeName  = tostring(boerse["langbezeichnung"] or ""),
     }
   end
 
   return {
-    balance    = payload["depotwert"] or 0,  -- total depot value in EUR
+    balance    = total_value,
     currency   = "EUR",
     securities = securities,
   }
 end
 
 function EndSession()
-  g_jwt      = nil
-  g_phase    = 0
-  g_holdings = nil
+  g_jwt          = nil
+  g_phase        = 0
+  g_access_token = nil
 end
