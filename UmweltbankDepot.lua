@@ -300,9 +300,9 @@ local function version_info_word(ver)
 end
 
 -- Writes the 15-bit format info word into two copies: L-strip at top-left, mirrored at top-right and bottom-left.
--- Spec (ISO 18004 Fig. 25): f0 (LSB) at (8,0), f1 at (8,1), ..., f5 at (8,5),
--- f6 at (8,7) [col 6 = timing skipped], f7 at (8,8),
--- f8 at (8,7), f7 at (8,8), f6..f0 at rows (7,8),(5,8)..(0,8) [row 6 = timing skipped].
+-- Spec (ISO 18004 Fig. 25): bit14 (MSB) at (8,0), bit13 at (8,1), ..., bit9 at (8,5),
+-- bit8 at (8,7) [col 6 = timing skipped], bit7 at (8,8),
+-- bit6..bit0 at rows (7,8),(5,8)..(0,8) [row 6 = timing skipped].
 -- Copy 2: bit0..bit7 at (8,n-1)..(8,n-8); bit8..bit14 at (n-7,8)..(n-1,8).
 local function place_format(m, n, fi)
   local bits = {}
@@ -709,27 +709,6 @@ end
 -- QR code → PNG image
 -- ─────────────────────────────────────────────────────────────────────────────
 
-local function qr_svg(text, module_px)
-  module_px = module_px or 10
-  local mat, n = qr_matrix(text)
-  local quiet = 4
-  local total = (n + 2*quiet) * module_px
-  local parts = {
-    string.format('<svg xmlns="http://www.w3.org/2000/svg" width="%d" height="%d" viewBox="0 0 %d %d">', total, total, total, total),
-    string.format('<rect width="%d" height="%d" fill="white"/>', total, total),
-  }
-  for r = 0, n-1 do
-    for c = 0, n-1 do
-      if mat[r] and mat[r][c] == 1 then
-        parts[#parts+1] = string.format('<rect x="%d" y="%d" width="%d" height="%d" fill="black"/>',
-          (c + quiet) * module_px, (r + quiet) * module_px, module_px, module_px)
-      end
-    end
-  end
-  parts[#parts+1] = '</svg>'
-  return table.concat(parts)
-end
-
 local function qr_png(text, scale, quiet)
   scale = scale or 4
   quiet = quiet or 4
@@ -755,12 +734,6 @@ end
 -- ─────────────────────────────────────────────────────────────────────────────
 -- Utilities
 -- ─────────────────────────────────────────────────────────────────────────────
-
-local function url_encode(s)
-  return (s:gsub("[^%w%-_.~]", function(c)
-    return string.format("%%%02X", string.byte(c))
-  end))
-end
 
 -- Pseudo-random UUID v4 for the OAuth state parameter.
 -- Collision probability is negligible for single-user interactive sessions.
@@ -803,8 +776,11 @@ end
 -- connection:get() returns headers as its 5th value regardless.
 local function get_redirect_location(url)
   connection.redirects = false
-  local _, _, _, _, headers = connection:get(url)
+  local ok, _, _, _, _, headers = pcall(function()
+    return connection:get(url)
+  end)
   connection.redirects = true
+  if not ok then return nil end
   return headers and headers["Location"]
 end
 
