@@ -93,8 +93,8 @@ local function rs_generator(n)
     local ng = {}
     for j = 1, #g + 1 do ng[j] = 0 end
     for j = 1, #g do
-      ng[j]   = ng[j]   ~ gf_mul(g[j], GF_EXP[i])
-      ng[j+1] = ng[j+1] ~ g[j]
+      ng[j]   = ng[j]   ~ g[j]
+      ng[j+1] = ng[j+1] ~ gf_mul(g[j], GF_EXP[i])
     end
     g = ng
   end
@@ -197,12 +197,15 @@ local function is_func(ver, n, r, c)
   -- They let the decoder calculate the exact module grid even in blurry images.
   if r == 6 or c == 6 then return true end
 
-  -- Alignment patterns: 5×5 squares at all pairwise intersections of ALIGN coords.
+  -- Alignment patterns: 5×5 squares at pairwise intersections of ALIGN coords,
+  -- excluding the three corners that overlap finder patterns.
   local ap = ALIGN[ver]
   if ap then
+    local ap1, apl = ap[1], ap[#ap]
     for _, cr in ipairs(ap) do
       for _, cc in ipairs(ap) do
-        if math.abs(r-cr) <= 2 and math.abs(c-cc) <= 2 then return true end
+        local finder_corner = (cr == ap1 and (cc == ap1 or cc == apl)) or (cr == apl and cc == ap1)
+        if not finder_corner and math.abs(r-cr) <= 2 and math.abs(c-cc) <= 2 then return true end
       end
     end
   end
@@ -297,28 +300,31 @@ local function version_info_word(ver)
 end
 
 -- Writes the 15-bit format info word into two copies: L-strip at top-left, mirrored at top-right and bottom-left.
+-- Spec (ISO 18004 Fig. 25): bit14 (MSB) at (8,0), bit13 at (8,1), ..., bit9 at (8,5),
+-- bit8 at (8,7) [col 6 = timing skipped], bit7 at (8,8),
+-- bit6..bit0 at rows (7,8),(5,8)..(0,8) [row 6 = timing skipped].
+-- Copy 2: bit0..bit7 at (8,n-1)..(8,n-8); bit8..bit14 at (n-7,8)..(n-1,8).
 local function place_format(m, n, fi)
   local bits = {}
   for b = 14, 0, -1 do bits[#bits+1] = (fi >> b) & 1 end
+  -- bits[1]=bit14 (MSB) … bits[15]=bit0 (LSB)
 
-  -- Copy 1 horizontal arm (row 8): f14 … f7  (bi ends at 8, col 8 = f7)
-  local bi = 1
-  for c = 0, 5 do m[8][c] = bits[bi]; bi=bi+1 end
-  m[8][7] = bits[bi]; bi=bi+1   -- skip col 6 (timing strip)
-  m[8][8] = bits[bi]; bi=bi+1   -- corner module; bi is now 9
+  -- Copy 1: bit14 at (8,0), down to bit0 at (0,8)
+  local bi = 1  -- start at MSB (bit14)
+  for c = 0, 5 do m[8][c] = bits[bi]; bi=bi+1 end   -- bits 14..9 at cols 0..5
+  m[8][7] = bits[bi]; bi=bi+1                         -- bit 8 at col 7 (col 6 = timing)
+  m[8][8] = bits[bi]; bi=bi+1                         -- bit 7 at col 8
 
-  -- Copy 1 vertical arm (col 8): f6 … f0  (bi continues from 9)
   for r = 7, 0, -1 do
-    if r ~= 6 then m[r][8] = bits[bi]; bi=bi+1 end  -- skip row 6 (timing strip)
+    if r ~= 6 then m[r][8] = bits[bi]; bi=bi+1 end   -- bits 6..0 at rows 7,5,4,3,2,1,0
   end
 
-  -- Copy 2 top-right (row 8, cols n-1 down to n-8): f14 … f7
-  bi = 1
-  for c = n-1, n-8, -1 do m[8][c] = bits[bi]; bi=bi+1 end
+  -- Copy 2 top-right: bit0..bit7 at row 8, cols n-1..n-8 (8 modules)
+  bi = 15  -- start at bit0 (LSB)
+  for c = n-1, n-8, -1 do m[8][c] = bits[bi]; bi=bi-1 end
 
-  -- Copy 2 bottom-left (col 8, rows n-7 up to n-1): f6 … f0
-  bi = 9
-  for r = n-7, n-1 do m[r][8] = bits[bi]; bi=bi+1 end
+  -- Copy 2 bottom-left: bit8..bit14 at col 8, rows n-7..n-1 (7 modules; bi continues from 7)
+  for r = n-7, n-1 do m[r][8] = bits[bi]; bi=bi-1 end
 end
 
 -- ─────────────────────────────────────────────────────────────────────────────
@@ -437,9 +443,13 @@ local function build_matrix(ver, codewords)
   -- ── Alignment patterns ───────────────────────────────────────────────────
   local ap = ALIGN[ver]
   if ap then
+    local ap1, apl = ap[1], ap[#ap]
     for _, cr in ipairs(ap) do
       for _, cc in ipairs(ap) do
-        place_alignment(m, cr, cc)  -- skips overlapping finder/timing positions
+        local finder_corner = (cr == ap1 and (cc == ap1 or cc == apl)) or (cr == apl and cc == ap1)
+        if not finder_corner then
+          place_alignment(m, cr, cc)
+        end
       end
     end
   end
@@ -448,11 +458,13 @@ local function build_matrix(ver, codewords)
   -- Fill with 0 so that the zigzag data-placement loop (below) skips these spots.
   -- The real format info bits are written AFTER masking is complete (place_format),
   -- because the format word encodes which mask was chosen.
-  for i = 0, 8 do
-    if m[8][i]     == nil then m[8][i]     = 0 end
-    if m[i][8]     == nil then m[i][8]     = 0 end
-    if m[8][n-1-i] == nil then m[8][n-1-i] = 0 end
-    if m[n-1-i][8] == nil then m[n-1-i][8] = 0 end
+  for i = 0, 8 do  -- top-left: row 8 cols 0-8, col 8 rows 0-8 (all is_func)
+    if m[8][i] == nil then m[8][i] = 0 end
+    if m[i][8] == nil then m[i][8] = 0 end
+  end
+  for i = 0, 7 do  -- top-right / bottom-left: only n-1..n-8 (all is_func); n-9 is a data cell
+    if m[8][n-1-i]   == nil then m[8][n-1-i]   = 0 end
+    if m[n-1-i][8]   == nil then m[n-1-i][8]   = 0 end
   end
   if ver >= 7 then  -- version info blocks only from QR code version 7 onwards
     for i = 0, 2 do for j = 0, 5 do
@@ -605,7 +617,7 @@ local function qr_matrix(text)
   if ver >= 7 then
     local vi = version_info_word(ver)
     for i = 0, 2 do for j = 0, 5 do
-      local bit = (vi >> (i*6+j)) & 1
+      local bit = (vi >> (j*3+i)) & 1
       best_m[n-11+i][j] = bit  -- bottom-left block
       best_m[j][n-11+i] = bit  -- top-right block
     end end
@@ -723,12 +735,6 @@ end
 -- Utilities
 -- ─────────────────────────────────────────────────────────────────────────────
 
-local function url_encode(s)
-  return (s:gsub("[^%w%-_.~]", function(c)
-    return string.format("%%%02X", string.byte(c))
-  end))
-end
-
 -- Pseudo-random UUID v4 for the OAuth state parameter.
 -- Collision probability is negligible for single-user interactive sessions.
 local function uuid()
@@ -744,6 +750,7 @@ end
 -- ─────────────────────────────────────────────────────────────────────────────
 
 local g_jwt          = nil   -- QR challenge JWT (used to poll status and call qr-login)
+local g_qr_url       = nil   -- SecureGo plus login URL encoded in the QR image
 local g_phase        = 0     -- counts how many times InitializeSession2 has been called
 local g_access_token = nil   -- portal access_token, set when TOKEN_ENDPOINT returns JSON (not cookies)
 
@@ -764,23 +771,54 @@ function SupportsBank(protocol, bankCode)
   return protocol == ProtocolWebBanking and bankCode == "Umweltbank Depot"
 end
 
--- MoneyMoney calls InitializeSession2 once to show the challenge, then again
--- after the user clicks OK.  g_phase tracks which call is being handled.
+-- Returns the Location header of a redirect response without following it.
+-- connection.redirects = false suppresses automatic redirect following;
+-- connection:get() returns headers as its 5th value regardless.
+local function get_redirect_location(url)
+  connection.redirects = false
+  local ok, _, _, _, _, headers = pcall(function()
+    return connection:get(url)
+  end)
+  connection.redirects = true
+  if not ok then return nil end
+  return headers and headers["Location"]
+end
+
+-- Walks a redirect chain one hop at a time until a URL matching targetPrefix
+-- is found, then returns it.  Used to extract portal/login?code=X without
+-- MoneyMoney consuming the URL by following the redirect automatically.
+local function follow_to_portal_code(start_url)
+  local url = start_url
+  for _ = 1, 10 do
+    local loc = get_redirect_location(url)
+    if not loc then return nil end
+    if loc:find(REDIRECT_URI, 1, true) == 1 then return loc end
+    url = loc
+  end
+  return nil
+end
+
+local function qr_challenge()
+  local png = type(renderQrCodePng) == "function"
+    and renderQrCodePng(g_qr_url, 600)
+    or  qr_png(g_qr_url, 10, 4)
+  return {title = "Umweltbank QR-Login", challenge = png, poll = true}
+end
+
+-- MoneyMoney calls InitializeSession2 repeatedly due to poll=true.
+-- Phase 1 sets up the session and emits the QR challenge.
+-- Phase 2+ polls the approval status; on APPROVED the auth chain completes.
 function InitializeSession2(protocol, bank, username, reserved, password)
   g_phase = g_phase + 1
 
-  -- ── Phase 1: start a CAS session and emit the QR code challenge ──────────
+  -- ── Phase 1: start CAS session and emit QR challenge ─────────────────────
   if g_phase == 1 then
-    -- Route through portal-oauth so it generates and stores the internal state
-    -- it will verify when portal-oauth/login is called in phase 2.
-    -- The redirect chain (portal-oauth → CAS → auth-frontend) also sets CAS_SESSION.
+    -- Primes the portal-oauth state and sets the CAS_SESSION cookie.
     connection:get(AUTHORIZE_ENDPOINT
       .. "?response_type=code&client_id=online-banking"
-      .. "&redirect_uri=" .. url_encode(REDIRECT_URI))
+      .. "&redirect_uri=" .. MM.urlencode(REDIRECT_URI))
 
-    -- init-ui returns branding config for the QR login screen.
-    local ui_resp = connection:get(QR_INIT_UI_ENDPOINT)
-    local ui_data = JSON(ui_resp):dictionary()
+    local ui_data = JSON(connection:get(QR_INIT_UI_ENDPOINT)):dictionary()
     if ui_data["qrCodeLoginAllowed"] == false then
       error("QR-Code Login ist noch nicht aktiviert.\n\n"
           .. "Bitte öffnen Sie banking.umweltbank.de im Browser, melden Sie sich "
@@ -788,151 +826,75 @@ function InitializeSession2(protocol, bank, username, reserved, password)
           .. "SecureGo plus. Danach kann diese Erweiterung genutzt werden.")
     end
 
-    local resp = connection:request("POST", QR_INIT_CODE_ENDPOINT, "", "", {
-      ["Origin"] = BASE,
-      ["Referer"] = BASE .. "/",
-    })
-    local data = JSON(resp):dictionary()
-    -- The JWT encodes the login challenge; SecureGo plus decodes it and signs
-    -- a confirmation that travels back to the server via the push notification.
+    local data = JSON(connection:request("POST", QR_INIT_CODE_ENDPOINT, "", "", {
+      ["Origin"] = BASE, ["Referer"] = BASE .. "/",
+    })):dictionary()
     g_jwt = data["qrCodeJwt"]
     if not g_jwt or g_jwt == "" then
       error("QR-Code konnte nicht abgerufen werden.")
     end
 
-    -- Encode the JWT as a QR image and hand it to MoneyMoney as an image challenge.
-    -- MoneyMoney will display the PNG to the user and call us again (phase 2)
-    -- after they click OK.
-    local qr_url = string.gsub(ui_data["qrCodeUrl"], "{JWT}", g_jwt)
-    local png = qr_png(qr_url, 4, 4)
-    return {
-      title     = "Umweltbank QR-Login",
-      challenge = png,
-      label     = "Bitte QR-Code mit SecureGo plus scannen und dann OK klicken.",
-    }
+    g_qr_url = string.gsub(ui_data["qrCodeUrl"], "{JWT}", g_jwt)
+    return qr_challenge()
 
-  -- ── Phase 2: complete the authentication chain ───────────────────────────
-  elseif g_phase == 2 then
+  -- ── Phase 2+: poll status, complete auth on APPROVED ─────────────────────
+  else
+    local state = JSON(connection:request("GET", QR_STATUS_ENDPOINT, nil, nil,
+      {["Authorization"] = "Bearer " .. g_jwt})):dictionary()["state"]
 
-    -- Poll the status endpoint until SecureGo plus has approved the scan.
-    -- The browser normally does this with short-polling every 2 seconds.
-    local approved = false
-    for _ = 1, 90 do  -- 90 × 2 s = 3 minutes maximum
-      local sr = connection:request("GET", QR_STATUS_ENDPOINT, nil, nil,
-        {["Authorization"] = "Bearer " .. g_jwt})
-      local st = JSON(sr):dictionary()
-      local state = st["state"]
-      if state == "APPROVED" then
-        approved = true; break
-      elseif state == "REJECTED" or state == "CANCELLED" then
-        -- The user actively declined the request in SecureGo plus.
-        error("QR-Code Login wurde in SecureGo plus abgelehnt. Bitte erneut versuchen.")
-      elseif state == "EXPIRED" then
-        -- The JWT has a short TTL; if the user takes too long to open SecureGo plus
-        -- the server invalidates it before they can scan.
-        error("QR-Code abgelaufen. Bitte die Anmeldung neu starten und den Code innerhalb von 3 Minuten scannen.")
-      elseif state ~= nil then
-        -- Unknown terminal state — fail immediately rather than burning the full timeout.
-        error("QR-Authentifizierung: unbekannter Status '" .. state .. "'. Bitte erneut versuchen.")
-      end
-      MM.sleep(2000)
-    end
-    if not approved then
-      error("QR-Code Timeout: Bitte erneut versuchen und den Code innerhalb von 3 Minuten scannen.")
+    if state == nil or state == "RETRY" then
+      return qr_challenge()  -- still waiting for scan, keep polling
+    elseif state == "REJECTED" or state == "CANCELLED" then
+      error("QR-Code Login wurde in SecureGo plus abgelehnt. Bitte erneut versuchen.")
+    elseif state == "EXPIRED" then
+      error("QR-Code abgelaufen. Bitte die Anmeldung neu starten.")
+    elseif state ~= "APPROVED" then
+      error("QR-Authentifizierung: unbekannter Status '" .. state .. "'.")
     end
 
-    -- qr-login advances the CAS authentication state to "completed".
-    -- The server checks that the JWT was genuinely approved by SecureGo plus.
-    local lr = connection:request("POST", QR_LOGIN_ENDPOINT, "{}", "application/json",
-      {["Authorization"] = "Bearer " .. g_jwt})
-    local ld = JSON(lr):dictionary()
-    local apr = ld["authenticationProcessResponse"]
+    -- Approved: advance CAS authentication state.
+    local apr = JSON(connection:request("POST", QR_LOGIN_ENDPOINT, "{}", "application/json",
+      {["Authorization"] = "Bearer " .. g_jwt})):dictionary()["authenticationProcessResponse"]
     if not apr then error("qr-login: unerwartete Antwort vom Server.") end
 
     if not apr["authenticationProcessCompleted"] then
-      -- If the server says the first step is QR_CODE_FIRST_LOGIN, the user has
-      -- never used QR login before.  They need to activate it in the browser once
-      -- (Settings → QR-Code Login), because SecureGo plus only gets registered
-      -- for QR login after the user opts in interactively.
       local ns = apr["nextAuthenticationProcessStep"]
       if ns then
         for _, a in ipairs(ns["actions"] or {}) do
           if a["stepType"] == "QR_CODE_FIRST_LOGIN" then
             error("Bitte aktivieren Sie den QR-Code Login zuerst einmal im Browser "
-                .."unter banking.umweltbank.de (Menü → QR-Code Login).")
+                .. "unter banking.umweltbank.de (Menü → QR-Code Login).")
           end
         end
       end
       error("QR-Authentifizierung nicht abgeschlossen.")
     end
 
-    -- Finalize CAS.  The response body contains the OAuth callback parameters
-    -- (code, state, iss) the CAS server would normally deliver via redirect to
-    -- CAS_REDIRECT_URI.  We extract them and call that endpoint ourselves.
-    local consent_resp = connection:request("POST", CONSENT_ENDPOINT, '{"useBrowserDetection":false}', "application/json")
-    local consent_data = JSON(consent_resp):dictionary()
-    local cr = consent_data["postAuthenticationProcessResponse"]
+    -- Finalize CAS; response body contains the callback params for portal-oauth/login.
+    local cr = JSON(connection:request("POST", CONSENT_ENDPOINT,
+      '{"useBrowserDetection":false}', "application/json")):dictionary()
+    cr = cr["postAuthenticationProcessResponse"]
     cr = cr and cr["resultOfCurrentPostAuthenticationProcessStep"]
     local param_str = cr and cr["parameter"]
     if not param_str then
       error("Consent fehlgeschlagen: kein Weiterleitungsparameter erhalten.")
     end
 
-    -- Establish the portal session: portal-oauth/login validates the CAS code and
-    -- sets portal session cookies.  MoneyMoney follows all redirects automatically:
-    --   portal-oauth/login → portal-oauth/oauth/authorize → portal/login?code=X → HTML
-    -- The portal code is only in the intermediate redirect URL and is not accessible
-    -- from Lua (MoneyMoney exposes no API for intermediate redirect URLs).
-    -- The code IS visible in the MoneyMoney log window.  We show a challenge asking
-    -- the user to copy it so that we can call TOKEN_ENDPOINT in phase 3.
-    connection:get(CAS_REDIRECT_URI .. "?" .. param_str)
-
-    -- A challenge image is required for MoneyMoney to display the text-input field.
-    local hint_png = make_png(string.rep("\xFF", 200 * 40), 200, 40)
-    return {
-      title     = "Umweltbank – Portal-Code eingeben",
-      challenge = hint_png,
-      label     = "Protokoll öffnen (Hilfe → Protokoll anzeigen),"
-                .. " letzten »portal/login?code=…« finden,"
-                .. " langen Wert nach »code=« kopieren und hier einfügen:",
-    }
-  elseif g_phase == 3 then
-    -- ── Phase 3: exchange the portal code entered by the user ─────────────────
-    -- MoneyMoney passes challenge input as password; reserved is the stored account
-    -- password. Try both in case the assignment is reversed on some MM versions.
-    local function dump(v, depth)
-      depth = depth or 0
-      if type(v) ~= "table" or depth > 2 then return tostring(v) end
-      local parts = {}
-      for k, w in pairs(v) do
-        table.insert(parts, tostring(k) .. "=" .. dump(w, depth + 1))
-      end
-      return "{" .. table.concat(parts, ", ") .. "}"
-    end
-
-    local portal_code
-    if type(password) == "string" and #password >= 10 then
-      portal_code = password
-    elseif type(reserved) == "string" and #reserved >= 10 then
-      portal_code = reserved
-    elseif type(reserved) == "table" and type(reserved[1]) == "string" and #reserved[1] >= 10 then
-      -- MoneyMoney passes challenge text input as reserved[1]
-      portal_code = reserved[1]
-    end
+    -- Walk the redirect chain manually to capture the portal code.
+    -- With connection.redirects = false we can read each Location header:
+    --   portal-oauth/login → portal-oauth/oauth/authorize → portal/login?code=X
+    local portal_url = follow_to_portal_code(CAS_REDIRECT_URI .. "?" .. param_str)
+    local portal_code = portal_url and portal_url:match("[?&]code=([^&]+)")
     if not portal_code then
-      error("Portal-Code nicht erhalten.\n"
-          .. "password: " .. type(password) .. " = " .. tostring(password) .. "\n"
-          .. "reserved: " .. dump(reserved) .. "\n\n"
-          .. "Bitte das Eingabefeld mit dem Code aus dem Protokoll befüllen.")
+      error("Portal-Code nicht gefunden in der Redirect-Kette.")
     end
-    -- Strip any leading/trailing whitespace the user might have accidentally added.
-    portal_code = portal_code:match("^%s*(.-)%s*$")
 
+    -- Exchange portal code for session tokens / HttpOnly cookies.
     local tok_resp = connection:request("POST", TOKEN_ENDPOINT,
       "grant_type=authorization_code"
         .. "&code=" .. portal_code
         .. "&client_id=online-banking"
-        .. "&redirect_uri=" .. url_encode(REDIRECT_URI),
+        .. "&redirect_uri=" .. MM.urlencode(REDIRECT_URI),
       "application/x-www-form-urlencoded")
     local tok_data = {}
     local parse_ok = pcall(function() tok_data = JSON(tok_resp):dictionary() end)
@@ -940,16 +902,10 @@ function InitializeSession2(protocol, bank, username, reserved, password)
       g_access_token = tok_data["access_token"]
     elseif parse_ok and tok_data["error"] then
       error("Token-Austausch fehlgeschlagen: "
-          .. (tok_data["error_description"] or tok_data["error"])
-          .. "\n\nBitte Browser-DevTools öffnen (F12 → Network), bei Umweltbank einloggen"
-          .. "\nund den POST zu /portal-oauth/oauth/token beobachten:"
-          .. "\n  – Request-Body: grant_type, code, client_id, redirect_uri"
-          .. "\n  – Response: JSON-Body und Set-Cookie-Header")
+          .. (tok_data["error_description"] or tok_data["error"]))
     end
-    -- If tok_data has neither field, TOKEN_ENDPOINT set HttpOnly cookies which
-    -- MoneyMoney's cookie jar will send automatically with subsequent requests.
-  else
-    error("InitializeSession2 unerwartet in Phase " .. g_phase .. " aufgerufen.")
+    -- TOKEN_ENDPOINT may return HttpOnly cookies instead of JSON; the cookie jar
+    -- handles those automatically.
   end
 end
 
@@ -1032,6 +988,7 @@ end
 
 function EndSession()
   g_jwt          = nil
+  g_qr_url       = nil
   g_phase        = 0
   g_access_token = nil
 end
