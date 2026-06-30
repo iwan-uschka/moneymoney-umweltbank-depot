@@ -23,7 +23,7 @@ Each sync triggers a two-phase authentication. No credentials are stored or tran
 
 1. **QR code displayed** — MoneyMoney shows a QR code generated from the server-issued JWT challenge.
 2. **Scan in SecureGo plus** — Open the app, scan the code, and confirm the login request on the phone.
-3. **Click OK in MoneyMoney** — The extension polls for approval, completes the OAuth flow, and fetches the portfolio.
+3. **Automatic completion** — MoneyMoney polls for approval in the background. Once SecureGo plus confirms, the dialog closes automatically and the portfolio is fetched.
 
 ## Why QR-Code Login
 
@@ -36,8 +36,7 @@ The QR code image is generated entirely within the extension in pure Lua: GF(256
 - **Unsigned extension** — MoneyMoney will warn that the extension is not from a verified developer. You need to explicitly allow unsigned extensions under MoneyMoney → Preferences → Extensions.
 - **Dummy credentials required** — The "Add Account" dialog always shows username and password fields. MoneyMoney does not allow extensions to hide or relabel them. Enter any values you like — they are never used or transmitted; authentication happens entirely via QR code.
 - **QR code display size** — The challenge dialog renders the QR code smaller than ideal. If your phone camera struggles to scan it, use macOS Accessibility Zoom (System Settings → Accessibility → Zoom) or hold Option and scroll to magnify the relevant area of the screen.
-- **First sync** — the holdings endpoint is seeded with an empty positions list. If the server does not populate positions from the account state, a separate initial-holdings endpoint may need to be discovered.
-- **Redirect chain** — the portal OAuth redirect chain is followed automatically by MoneyMoney's HTTP client. If auth-code extraction fails, open a GitHub issue with the error message shown by MoneyMoney.
+- **Redirect chain** — the portal OAuth redirect chain is walked manually (automatic redirect following is disabled) to extract the auth code from the final URL. If Umweltbank changes the redirect URL structure this may break. Open a GitHub issue with the error message shown by MoneyMoney.
 - **Securities only** — transaction history is not available through the portal API.
 
 ## Technical Reference
