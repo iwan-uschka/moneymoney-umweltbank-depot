@@ -25,12 +25,11 @@ local QR_STATUS_ENDPOINT    = BASE .. "/services_auth/auth-qr-service/api/status
 local QR_LOGIN_ENDPOINT     = BASE .. "/services_auth/auth-backend/api/authentication/qr-login"
 
 -- ── CAS session initiation ───────────────────────────────────────────────────
--- GET CAS_AUTHORIZE_ENDPOINT issues a 302 that sets the CAS_SESSION cookie.
--- auth-qr-service rejects all requests without it ("Cookie 'CAS_SESSION' not found").
--- client_id and claims are fixed values the portal always sends; state/nonce are random.
-local CAS_AUTHORIZE_ENDPOINT = BASE .. "/services_auth/oauth2/authorize"
-local CAS_REDIRECT_URI       = BASE .. "/services_cloud/portal/portal-oauth/login"
-local CAS_CLAIMS             = "%7B%22id_token%22:%7B%22https://cas.bankenit.de/id/type%22:%7B%22essential%22:true%7D,%22https://cas.bankenit.de/id/tan_status%22:%7B%22essential%22:false%7D,%22birthdate%22:%7B%22essential%22:true%7D,%22https://cas.bankenit.de/id/salutation%22:%7B%22essential%22:true%7D,%22https://cas.bankenit.de/id/version%22:%7B%22essential%22:true%7D,%22https://cas.bankenit.de/id/allowed_scopes%22:%7B%22essential%22:true%7D,%22given_name%22:%7B%22essential%22:true%7D,%22https://cas.bankenit.de/id/bankKunde%22:%7B%22essential%22:true%7D,%22acr%22:%7B%22essential%22:true,%22values%22:%5B%22onlinebanking_psd2%22,%22onlinebanking_pin%22%5D%7D,%22https://cas.bankenit.de/id/pin_status%22:%7B%22essential%22:false%7D,%22https://cas.bankenit.de/id/last_login%22:%7B%22essential%22:true%7D,%22family_name%22:%7B%22essential%22:true%7D,%22email%22:%7B%22essential%22:true%7D,%22jti%22:%7B%22essential%22:true%7D,%22https://cas.bankenit.de/id/vertriebskunden_id%22:%7B%22essential%22:true%7D,%22sid%22:%7B%22essential%22:true%7D%7D%7D"
+-- Reaching AUTHORIZE_ENDPOINT (below) causes the portal to internally redirect
+-- through CAS's own oauth2/authorize, which sets the CAS_SESSION cookie as a
+-- side effect. auth-qr-service rejects all requests without it
+-- ("Cookie 'CAS_SESSION' not found").
+local CAS_REDIRECT_URI = BASE .. "/services_cloud/portal/portal-oauth/login"
 
 -- ── Portal OAuth endpoints ───────────────────────────────────────────────────
 -- CONSENT_ENDPOINT  : completes the CAS login and returns the CAS callback parameters
@@ -732,20 +731,6 @@ local function qr_png(text, scale, quiet)
 end
 
 -- ─────────────────────────────────────────────────────────────────────────────
--- Utilities
--- ─────────────────────────────────────────────────────────────────────────────
-
--- Pseudo-random UUID v4 for the OAuth state parameter.
--- Collision probability is negligible for single-user interactive sessions.
-local function uuid()
-  local t = {}
-  for i = 1, 32 do t[i] = string.format("%x", math.random(0,15)) end
-  table.insert(t, 9,  "-"); table.insert(t, 14, "-")
-  table.insert(t, 19, "-"); table.insert(t, 24, "-")
-  return table.concat(t)
-end
-
--- ─────────────────────────────────────────────────────────────────────────────
 -- Session state (module-level; persists across InitializeSession2 phases)
 -- ─────────────────────────────────────────────────────────────────────────────
 
@@ -834,6 +819,9 @@ function InitializeSession2(protocol, bank, username, reserved, password)
       error("QR-Code konnte nicht abgerufen werden.")
     end
 
+    if not ui_data["qrCodeUrl"] or ui_data["qrCodeUrl"] == "" then
+      error("QR-Code URL Vorlage fehlt in der Antwort von init-ui.")
+    end
     g_qr_url = string.gsub(ui_data["qrCodeUrl"], "{JWT}", g_jwt)
     return qr_challenge()
 
