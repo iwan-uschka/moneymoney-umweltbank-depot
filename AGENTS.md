@@ -66,6 +66,11 @@ URL. Observed on
 - **MoneyMoney may keep serving a cached copy of the extension after the
   `.lua` file is replaced** (observed 2026-07-08 while A/B-testing versions).
   Always restart MoneyMoney before judging which version a test exercised.
+- **konto/group DEPOT identifier confirmed live 2026-07-07**: `businessIdent`
+  is the id `depots/{id}` expects; it equals `nummer` for DEPOT konten.
+  `kontonummer` and `iban` are `nil` for DEPOT konten. There is no literal
+  `depotNummer` field — the endpoint's URL segment name is informal, not a
+  JSON key.
 
 ## MoneyMoney Lua API gotchas (verified against moneymoney.app/api/webbanking)
 

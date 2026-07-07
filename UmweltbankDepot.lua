@@ -53,11 +53,14 @@ local TOKEN_ENDPOINT     = BASE .. "/services_cloud/portal/portal-oauth/oauth/to
 
 -- ── Data endpoints ───────────────────────────────────────────────────────────
 -- KONTO_GROUP_ENDPOINT : lists all accounts grouped by type; filtered for art == "DEPOT".
--- DEPOTS_ENDPOINT      : GET depots/{depotNummer} — returns positions with last-trading-day
+-- DEPOTS_ENDPOINT      : GET depots/{id} — returns positions with last-trading-day
 --                        prices (kursAktuell). depotwert is always 0; sum kurswertEUR instead.
+--                        {id} is konto["businessIdent"] from konto/group (confirmed live 2026-07-07;
+--                        equals konto["nummer"] for DEPOT konten; there is no separate
+--                        "depotNummer" field — kontonummer/iban are nil for DEPOT konten).
 local KONTO_GROUP_ENDPOINT = BASE .. "/services_cloud/portal/proxy-gateway/serviceproxy/konto-service/v2/konto/group"
 local _BESTAND_BASE   = BASE .. "/services_cloud/portal/proxy-gateway/serviceproxy/wporder-bestand-service-v1/rest/de.fiduciagad.dzwp.wporder.bestand.v1.bestand.BestandApi"
-local DEPOTS_ENDPOINT = _BESTAND_BASE .. "/depots/"   -- append depotNummer at runtime
+local DEPOTS_ENDPOINT = _BESTAND_BASE .. "/depots/"   -- append businessIdent at runtime
 
 -- ─────────────────────────────────────────────────────────────────────────────
 -- GF(256) – Galois Field arithmetic
@@ -740,7 +743,7 @@ end
 local g_jwt          = nil   -- QR challenge JWT (used to poll status and call qr-login)
 local g_qr_url       = nil   -- SecureGo plus login URL encoded in the QR image
 local g_phase        = 0     -- counts how many times InitializeSession2 has been called
-local g_access_token = nil   -- portal access_token; unused since portal/login sets HttpOnly cookies server-side
+local g_access_token = nil   -- portal access_token; sent as Authorization: Bearer on data calls (api_headers)
 local g_qr_png       = nil   -- cached QR PNG; encoded once, reused across poll ticks
 
 -- ─────────────────────────────────────────────────────────────────────────────
@@ -829,7 +832,11 @@ function InitializeSession2(protocol, bank, username, reserved, password)
     if not ui_data["qrCodeUrl"] or ui_data["qrCodeUrl"] == "" then
       error("QR-Code URL Vorlage fehlt in der Antwort von init-ui.")
     end
-    g_qr_url = string.gsub(ui_data["qrCodeUrl"], "{JWT}", g_jwt)
+    local n_subs
+    g_qr_url, n_subs = string.gsub(ui_data["qrCodeUrl"], "{JWT}", g_jwt)
+    if n_subs == 0 then
+      error("QR-Code URL Vorlage enthält keinen {JWT} Platzhalter.")
+    end
     return qr_challenge()
 
   -- ── Phase 2+: poll status, complete auth on APPROVED ─────────────────────
@@ -952,6 +959,9 @@ end
 
 function RefreshAccount(account, since)
   local depot_nr = account and account.accountNumber or ""
+  if depot_nr == "" then
+    error("RefreshAccount: keine Depotnummer im Konto vorhanden.")
+  end
 
   -- GET depots/{nr} returns positions with last-trading-day prices (kursAktuell).
   -- depotwert is always 0 from the API; we sum kurswertEUR across positions instead.
