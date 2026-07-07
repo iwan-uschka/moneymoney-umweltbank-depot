@@ -38,15 +38,18 @@ local CAS_REDIRECT_URI       = BASE .. "/services_cloud/portal/portal-oauth/logi
 --                     responds with a 302 redirect to REDIRECT_URI?code=<portal_code>.
 --                     MoneyMoney follows all redirects automatically, so the portal
 --                     code is only ever visible in the MoneyMoney log — not from Lua.
--- TOKEN_ENDPOINT    : exchanges the portal code for access_token/refresh_token.
---                     Tokens may be returned as HttpOnly cookies (sent automatically
---                     by MoneyMoney's cookie jar) or as JSON (stored in g_access_token).
 -- REDIRECT_URI      : where the portal expects the auth code to land. Must match
---                     exactly what the portal registered.
+--                     exactly what the portal registered. GETting the final
+--                     REDIRECT_URI?code=<portal_code> URL serves the SPA shell
+--                     only — it does NOT consume the code server-side. The SPA
+--                     reads the code from the URL and exchanges it client-side.
+-- TOKEN_ENDPOINT    : exchanges the portal code for the session. The banking SPA
+--                     calls this via XHR after loading; the tokens come back as
+--                     HttpOnly cookies (access_token authenticates the proxy-gateway).
 local CONSENT_ENDPOINT   = BASE .. "/services_auth/auth-backend/api/consent/execution"
 local AUTHORIZE_ENDPOINT = BASE .. "/services_cloud/portal/portal-oauth/oauth/authorize"
-local TOKEN_ENDPOINT     = BASE .. "/services_cloud/portal/portal-oauth/oauth/token"
 local REDIRECT_URI       = BASE .. "/services_cloud/portal/login"
+local TOKEN_ENDPOINT     = BASE .. "/services_cloud/portal/portal-oauth/oauth/token"
 
 -- ── Data endpoints ───────────────────────────────────────────────────────────
 -- KONTO_GROUP_ENDPOINT : lists all accounts grouped by type; filtered for art == "DEPOT".
@@ -737,7 +740,7 @@ end
 local g_jwt          = nil   -- QR challenge JWT (used to poll status and call qr-login)
 local g_qr_url       = nil   -- SecureGo plus login URL encoded in the QR image
 local g_phase        = 0     -- counts how many times InitializeSession2 has been called
-local g_access_token = nil   -- portal access_token, set when TOKEN_ENDPOINT returns JSON (not cookies)
+local g_access_token = nil   -- portal access_token; unused since portal/login sets HttpOnly cookies server-side
 local g_qr_png       = nil   -- cached QR PNG; encoded once, reused across poll ticks
 
 -- ─────────────────────────────────────────────────────────────────────────────
@@ -831,15 +834,8 @@ function InitializeSession2(protocol, bank, username, reserved, password)
 
   -- ── Phase 2+: poll status, complete auth on APPROVED ─────────────────────
   else
-    -- MoneyMoney's poll tick is fixed; check twice per tick (1 s apart) so an
-    -- approval in SecureGo plus is picked up roughly twice as fast.
-    local state
-    for attempt = 1, 2 do
-      state = JSON(connection:request("GET", QR_STATUS_ENDPOINT, nil, nil,
-        {["Authorization"] = "Bearer " .. g_jwt})):dictionary()["state"]
-      if state ~= nil and state ~= "RETRY" then break end
-      if attempt == 1 then MM.sleep(1) end
-    end
+    local state = JSON(connection:request("GET", QR_STATUS_ENDPOINT, nil, nil,
+      {["Authorization"] = "Bearer " .. g_jwt})):dictionary()["state"]
 
     if state == nil or state == "RETRY" then
       return qr_challenge()  -- still waiting for scan, keep polling
@@ -888,7 +884,12 @@ function InitializeSession2(protocol, bank, username, reserved, password)
       error("Portal-Code nicht gefunden in der Redirect-Kette.")
     end
 
-    -- Exchange portal code for session tokens / HttpOnly cookies.
+    -- Mirror the browser exactly: load the SPA shell at portal/login first (it
+    -- does not consume the code — the SPA reads it from the URL), then exchange
+    -- the code like the SPA's XHR does. Tokens arrive as HttpOnly cookies;
+    -- access_token is what authenticates the proxy-gateway (401 without it).
+    connection:get(portal_url)
+
     local tok_resp = connection:request("POST", TOKEN_ENDPOINT,
       "grant_type=authorization_code"
         .. "&code=" .. portal_code
@@ -903,23 +904,24 @@ function InitializeSession2(protocol, bank, username, reserved, password)
       error("Token-Austausch fehlgeschlagen: "
           .. (tok_data["error_description"] or tok_data["error"]))
     end
-    -- TOKEN_ENDPOINT may return HttpOnly cookies instead of JSON; the cookie jar
-    -- handles those automatically.
   end
 end
 
--- connection:get ignores its headers argument, so the session rides on cookies
--- alone. Deliberate: sending these headers via connection:request coincided with
--- gateway 400s behind the bank's F5/ASM (2026-07-07). Keep data calls
--- wire-identical to the browser-less cookie flow.
+-- Browser-like XHR headers for the data calls, matching what the banking SPA
+-- sends. Note: Connection:get silently ignores a headers argument — these only
+-- take effect via connection:request.
 local function api_headers()
-  local h = {["X-VP-App-Locale"] = "de-DE"}
+  local h = {
+    ["Accept"]          = "application/json, text/plain, */*",
+    ["X-VP-App-Locale"] = "de-DE",
+    ["Referer"]         = BASE .. "/services_cloud/portal/",
+  }
   if g_access_token then h["Authorization"] = "Bearer " .. g_access_token end
   return h
 end
 
 function ListAccounts(knownAccounts)
-  local resp = connection:get(KONTO_GROUP_ENDPOINT, api_headers())
+  local resp = connection:request("GET", KONTO_GROUP_ENDPOINT, nil, nil, api_headers())
   local data = JSON(resp):dictionary()
 
   local accounts = {}
@@ -953,7 +955,7 @@ function RefreshAccount(account, since)
 
   -- GET depots/{nr} returns positions with last-trading-day prices (kursAktuell).
   -- depotwert is always 0 from the API; we sum kurswertEUR across positions instead.
-  local resp    = connection:get(DEPOTS_ENDPOINT .. depot_nr, api_headers())
+  local resp    = connection:request("GET", DEPOTS_ENDPOINT .. depot_nr, nil, nil, api_headers())
   local data    = JSON(resp):dictionary()
   local payload = data["payload"]
   if not payload then
