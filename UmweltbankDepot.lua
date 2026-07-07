@@ -29,7 +29,7 @@ local QR_LOGIN_ENDPOINT     = BASE .. "/services_auth/auth-backend/api/authentic
 -- through CAS's own oauth2/authorize, which sets the CAS_SESSION cookie as a
 -- side effect. auth-qr-service rejects all requests without it
 -- ("Cookie 'CAS_SESSION' not found").
-local CAS_REDIRECT_URI = BASE .. "/services_cloud/portal/portal-oauth/login"
+local CAS_REDIRECT_URI       = BASE .. "/services_cloud/portal/portal-oauth/login"
 
 -- ── Portal OAuth endpoints ───────────────────────────────────────────────────
 -- CONSENT_ENDPOINT  : completes the CAS login and returns the CAS callback parameters
@@ -738,6 +738,7 @@ local g_jwt          = nil   -- QR challenge JWT (used to poll status and call q
 local g_qr_url       = nil   -- SecureGo plus login URL encoded in the QR image
 local g_phase        = 0     -- counts how many times InitializeSession2 has been called
 local g_access_token = nil   -- portal access_token, set when TOKEN_ENDPOINT returns JSON (not cookies)
+local g_qr_png       = nil   -- cached QR PNG; encoded once, reused across poll ticks
 
 -- ─────────────────────────────────────────────────────────────────────────────
 -- MoneyMoney extension
@@ -784,10 +785,13 @@ local function follow_to_portal_code(start_url)
 end
 
 local function qr_challenge()
-  local png = type(renderQrCodePng) == "function"
-    and renderQrCodePng(g_qr_url, 600)
-    or  qr_png(g_qr_url, 10, 4)
-  return {title = "Umweltbank QR-Login", challenge = png, poll = true}
+  -- Encode the PNG once; polling calls this on every tick.
+  if not g_qr_png then
+    g_qr_png = type(renderQrCodePng) == "function"
+      and renderQrCodePng(g_qr_url, 600)
+      or  qr_png(g_qr_url, 10, 4)
+  end
+  return {title = "Umweltbank QR-Login", challenge = g_qr_png, poll = true}
 end
 
 -- MoneyMoney calls InitializeSession2 repeatedly due to poll=true.
@@ -827,8 +831,15 @@ function InitializeSession2(protocol, bank, username, reserved, password)
 
   -- ── Phase 2+: poll status, complete auth on APPROVED ─────────────────────
   else
-    local state = JSON(connection:request("GET", QR_STATUS_ENDPOINT, nil, nil,
-      {["Authorization"] = "Bearer " .. g_jwt})):dictionary()["state"]
+    -- MoneyMoney's poll tick is fixed; check twice per tick (1 s apart) so an
+    -- approval in SecureGo plus is picked up roughly twice as fast.
+    local state
+    for attempt = 1, 2 do
+      state = JSON(connection:request("GET", QR_STATUS_ENDPOINT, nil, nil,
+        {["Authorization"] = "Bearer " .. g_jwt})):dictionary()["state"]
+      if state ~= nil and state ~= "RETRY" then break end
+      if attempt == 1 then MM.sleep(1) end
+    end
 
     if state == nil or state == "RETRY" then
       return qr_challenge()  -- still waiting for scan, keep polling
@@ -837,7 +848,7 @@ function InitializeSession2(protocol, bank, username, reserved, password)
     elseif state == "EXPIRED" then
       error("QR-Code abgelaufen. Bitte die Anmeldung neu starten.")
     elseif state ~= "APPROVED" then
-      error("QR-Authentifizierung: unbekannter Status '" .. state .. "'.")
+      error("QR-Authentifizierung: unbekannter Status '" .. tostring(state) .. "'.")
     end
 
     -- Approved: advance CAS authentication state.
@@ -897,6 +908,10 @@ function InitializeSession2(protocol, bank, username, reserved, password)
   end
 end
 
+-- connection:get ignores its headers argument, so the session rides on cookies
+-- alone. Deliberate: sending these headers via connection:request coincided with
+-- gateway 400s behind the bank's F5/ASM (2026-07-07). Keep data calls
+-- wire-identical to the browser-less cookie flow.
 local function api_headers()
   local h = {["X-VP-App-Locale"] = "de-DE"}
   if g_access_token then h["Authorization"] = "Bearer " .. g_access_token end
@@ -918,7 +933,6 @@ function ListAccounts(knownAccounts)
           currency      = "EUR",
           portfolio     = true,
           type          = AccountTypePortfolio,
-          ident         = konto["ident"],
         }
       end
     end
@@ -927,9 +941,8 @@ function ListAccounts(knownAccounts)
     error("Kein Depot-Konto in konto/group gefunden (art == 'DEPOT').")
   end
   if #accounts > 1 then
-    -- aktuellekurse is session-scoped; the request carries no per-account selector,
-    -- so RefreshAccount would return identical holdings for every depot. Return only
-    -- the first to avoid silently duplicating positions across multiple accounts.
+    -- Restricted to the first depot: per-depot fetching with multiple depots has
+    -- not been verified against the live API yet.
     return {accounts[1]}
   end
   return accounts
@@ -955,15 +968,14 @@ function RefreshAccount(account, since)
     local val    = tonumber(pos["kurswertEUR"]) or 0
     total_value  = total_value + val
     securities[#securities+1] = {
-      name          = tostring(pos["kurzbezeichnung"] or ""),
-      isin          = tostring(pos["isin"] or ""),
-      wkn           = tostring(pos["wkn"] or ""),
-      quantity      = tonumber(pos["stueckNominal"]) or 0,
-      amount        = val,
-      currency      = tostring(pos["gattungsWaehrung"] or "EUR"),
-      purchasePrice = tonumber(pos["durchschnittlicherEinstandskurs"]) or 0,
-      price         = tonumber(kd["kursAktuell"]) or 0,
-      exchangeName  = tostring(boerse["langbezeichnung"] or ""),
+      name           = tostring(pos["kurzbezeichnung"] or ""),
+      isin           = tostring(pos["isin"] or ""),
+      securityNumber = tostring(pos["wkn"] or ""),
+      quantity       = tonumber(pos["stueckNominal"]) or 0,
+      amount         = val,
+      purchasePrice  = tonumber(pos["durchschnittlicherEinstandskurs"]) or 0,
+      price          = tonumber(kd["kursAktuell"]) or 0,
+      market         = tostring(boerse["langbezeichnung"] or ""),
     }
   end
 
@@ -979,4 +991,5 @@ function EndSession()
   g_qr_url       = nil
   g_phase        = 0
   g_access_token = nil
+  g_qr_png       = nil
 end
