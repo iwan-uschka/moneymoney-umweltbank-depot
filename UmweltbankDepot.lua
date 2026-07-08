@@ -784,10 +784,28 @@ local function follow_to_portal_code(start_url)
   for _ = 1, 10 do
     local loc = get_redirect_location(url)
     if not loc then return nil end
+    if loc:sub(1, 1) == "/" then loc = BASE .. loc end  -- tolerate relative Location headers
     if loc:find(REDIRECT_URI, 1, true) == 1 then return loc end
     url = loc
   end
   return nil
+end
+
+-- Parses a JSON response body into a dictionary with two failure modes made
+-- explicit: the F5 ASM WAF can answer 200 with an HTML block page instead of
+-- JSON ("Request Rejected ... support ID"), and any other non-JSON body would
+-- otherwise die with a raw parse error deep inside JSON().
+local function json_dict(resp, what)
+  if type(resp) == "string" and resp:find("Request Rejected", 1, true) then
+    local sid = resp:match("[Ss]upport ID[^%d]*(%d+)")
+    error(what .. ": Anfrage von der Bank-Firewall abgelehnt (ASM-Blockseite"
+        .. (sid and (", Support-ID " .. sid) or "") .. "). Bitte erneut versuchen.")
+  end
+  local ok, dict = pcall(function() return JSON(resp):dictionary() end)
+  if not ok then
+    error(what .. ": unerwartete Antwort vom Server (kein JSON).")
+  end
+  return dict
 end
 
 local function qr_challenge()
@@ -813,7 +831,7 @@ function InitializeSession2(protocol, bank, username, reserved, password)
       .. "?response_type=code&client_id=online-banking"
       .. "&redirect_uri=" .. MM.urlencode(REDIRECT_URI))
 
-    local ui_data = JSON(connection:get(QR_INIT_UI_ENDPOINT)):dictionary()
+    local ui_data = json_dict(connection:get(QR_INIT_UI_ENDPOINT), "init-ui")
     if ui_data["qrCodeLoginAllowed"] == false then
       error("QR-Code Login ist noch nicht aktiviert.\n\n"
           .. "Bitte öffnen Sie banking.umweltbank.de im Browser, melden Sie sich "
@@ -821,9 +839,9 @@ function InitializeSession2(protocol, bank, username, reserved, password)
           .. "SecureGo plus. Danach kann diese Erweiterung genutzt werden.")
     end
 
-    local data = JSON(connection:request("POST", QR_INIT_CODE_ENDPOINT, "", "", {
+    local data = json_dict(connection:request("POST", QR_INIT_CODE_ENDPOINT, "", "", {
       ["Origin"] = BASE, ["Referer"] = BASE .. "/",
-    })):dictionary()
+    }), "init-qr-code")
     g_jwt = data["qrCodeJwt"]
     if not g_jwt or g_jwt == "" then
       error("QR-Code konnte nicht abgerufen werden.")
@@ -841,8 +859,8 @@ function InitializeSession2(protocol, bank, username, reserved, password)
 
   -- ── Phase 2+: poll status, complete auth on APPROVED ─────────────────────
   else
-    local state = JSON(connection:request("GET", QR_STATUS_ENDPOINT, nil, nil,
-      {["Authorization"] = "Bearer " .. g_jwt})):dictionary()["state"]
+    local state = json_dict(connection:request("GET", QR_STATUS_ENDPOINT, nil, nil,
+      {["Authorization"] = "Bearer " .. g_jwt}), "QR-Status")["state"]
 
     if state == nil or state == "RETRY" then
       return qr_challenge()  -- still waiting for scan, keep polling
@@ -855,8 +873,8 @@ function InitializeSession2(protocol, bank, username, reserved, password)
     end
 
     -- Approved: advance CAS authentication state.
-    local apr = JSON(connection:request("POST", QR_LOGIN_ENDPOINT, "{}", "application/json",
-      {["Authorization"] = "Bearer " .. g_jwt})):dictionary()["authenticationProcessResponse"]
+    local apr = json_dict(connection:request("POST", QR_LOGIN_ENDPOINT, "{}", "application/json",
+      {["Authorization"] = "Bearer " .. g_jwt}), "qr-login")["authenticationProcessResponse"]
     if not apr then error("qr-login: unerwartete Antwort vom Server.") end
 
     if not apr["authenticationProcessCompleted"] then
@@ -873,8 +891,8 @@ function InitializeSession2(protocol, bank, username, reserved, password)
     end
 
     -- Finalize CAS; response body contains the callback params for portal-oauth/login.
-    local cr = JSON(connection:request("POST", CONSENT_ENDPOINT,
-      '{"useBrowserDetection":false}', "application/json")):dictionary()
+    local cr = json_dict(connection:request("POST", CONSENT_ENDPOINT,
+      '{"useBrowserDetection":false}', "application/json"), "Consent")
     cr = cr["postAuthenticationProcessResponse"]
     cr = cr and cr["resultOfCurrentPostAuthenticationProcessStep"]
     local param_str = cr and cr["parameter"]
@@ -929,7 +947,7 @@ end
 
 function ListAccounts(knownAccounts)
   local resp = connection:request("GET", KONTO_GROUP_ENDPOINT, nil, nil, api_headers())
-  local data = JSON(resp):dictionary()
+  local data = json_dict(resp, "konto/group")
 
   local accounts = {}
   for _, grp in ipairs(data["groups"] or {}) do
@@ -937,7 +955,8 @@ function ListAccounts(knownAccounts)
       if konto["art"] == "DEPOT" then
         accounts[#accounts+1] = {
           name          = konto["displayName"] or konto["bezeichnung"] or "Umweltbank Depot",
-          accountNumber = konto["businessIdent"] or konto["kontonummer"] or konto["iban"]
+          accountNumber = (konto["businessIdent"] and tostring(konto["businessIdent"]))
+                       or konto["kontonummer"] or konto["iban"]
                        or (konto["nummer"] and tostring(konto["nummer"])) or "",
           currency      = "EUR",
           portfolio     = true,
@@ -966,7 +985,7 @@ function RefreshAccount(account, since)
   -- GET depots/{nr} returns positions with last-trading-day prices (kursAktuell).
   -- depotwert is always 0 from the API; we sum kurswertEUR across positions instead.
   local resp    = connection:request("GET", DEPOTS_ENDPOINT .. depot_nr, nil, nil, api_headers())
-  local data    = JSON(resp):dictionary()
+  local data    = json_dict(resp, "depots/" .. depot_nr)
   local payload = data["payload"]
   if not payload then
     error("GET depots/" .. depot_nr .. ": keine Payload in der Antwort.")
@@ -979,15 +998,40 @@ function RefreshAccount(account, since)
     local boerse = kd["kursAktuellBoerse"] or {}
     local val    = tonumber(pos["kurswertEUR"]) or 0
     total_value  = total_value + val
+
+    -- notierungsart "STUECK" = share count, currencyOfQuantity must stay nil.
+    -- Anything else (e.g. percent-notated bonds) is a nominal denominated in
+    -- gattungsWaehrung. Unknown/missing notierungsart is treated as STUECK.
+    local nominal_ccy
+    if pos["notierungsart"] and pos["notierungsart"] ~= "STUECK" then
+      nominal_ccy = pos["gattungsWaehrung"]
+    end
+
+    -- kursAktuellTimeStamp is zone-less local time ("2026-07-07T17:36:08");
+    -- os.time interprets the broken-down table as local time, which matches.
+    local trade_ts
+    if type(kd["kursAktuellTimeStamp"]) == "string" then
+      local y, mo, d, h, mi, s = kd["kursAktuellTimeStamp"]
+        :match("^(%d+)%-(%d+)%-(%d+)T(%d+):(%d+):(%d+)")
+      if y then
+        trade_ts = os.time{year = tonumber(y), month = tonumber(mo), day = tonumber(d),
+                           hour = tonumber(h), min = tonumber(mi), sec = tonumber(s)}
+      end
+    end
+
     securities[#securities+1] = {
-      name           = tostring(pos["kurzbezeichnung"] or ""),
-      isin           = tostring(pos["isin"] or ""),
-      securityNumber = tostring(pos["wkn"] or ""),
-      quantity       = tonumber(pos["stueckNominal"]) or 0,
-      amount         = val,
-      purchasePrice  = tonumber(pos["durchschnittlicherEinstandskurs"]) or 0,
-      price          = tonumber(kd["kursAktuell"]) or 0,
-      market         = tostring(boerse["langbezeichnung"] or ""),
+      name                    = tostring(pos["kurzbezeichnung"] or ""),
+      isin                    = tostring(pos["isin"] or ""),
+      securityNumber          = tostring(pos["wkn"] or ""),
+      quantity                = tonumber(pos["stueckNominal"]) or 0,
+      currencyOfQuantity      = nominal_ccy,
+      amount                  = val,
+      purchasePrice           = tonumber(pos["durchschnittlicherEinstandskurs"]) or 0,
+      currencyOfPurchasePrice = pos["durchschnittlicherEinstandskurswaehrung"],
+      price                   = tonumber(kd["kursAktuell"]) or 0,
+      currencyOfPrice         = kd["kurswaehrung"],
+      tradeTimestamp          = trade_ts,
+      market                  = tostring(boerse["langbezeichnung"] or ""),
     }
   end
 

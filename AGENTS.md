@@ -56,10 +56,12 @@ URL. Observed on
   pcall-wrapped helper that logs `connection:getCookies()` NAMES and SIZES
   (never values) before each post-scan request — no setCookie, no header
   changes.
-- Data calls are deliberately kept wire-identical to the cookie-only flow
-  (`connection:get`, whose headers argument is silently ignored). A variant
-  sending `X-VP-App-Locale`/`Authorization` via `connection:request` plus
-  `setCookie` pruning was tried 2026-07-07 and withdrawn.
+- Data calls go through `connection:request` with browser-like SPA headers
+  (`Accept`, `X-VP-App-Locale`, `Referer`, plus `Authorization: Bearer` when
+  the token-exchange JSON parsed) since 2026-07-09 — see the intermittent-400
+  bullet above. An earlier variant (2026-07-07) that additionally did
+  `setCookie` pruning was withdrawn; never set or prune cookies against this
+  host (ASM warning above).
 - Cookies are path-scoped: CAS/auth cookies live under `/services_auth/*`,
   portal token cookies under `/services_cloud/portal*`. The data endpoints
   receive the `/services_cloud/portal*` + `/` cookie population.
@@ -71,6 +73,15 @@ URL. Observed on
   `kontonummer` and `iban` are `nil` for DEPOT konten. There is no literal
   `depotNummer` field — the endpoint's URL segment name is informal, not a
   JSON key.
+- **depots/{id} position fields confirmed live 2026-07-08** (sample: one EUR
+  fund position): `kursdaten.kurswaehrung` is the currency of `kursAktuell`;
+  `kursdaten.kursAktuellTimeStamp` is zone-less local time
+  ("2026-07-07T17:36:08"); `notierungsart` is `"STUECK"` for share counts
+  (`stueckNominalZusatz` "St."); `gattungsWaehrung` is the security's currency
+  (assumed to be the nominal currency for non-STUECK positions);
+  `durchschnittlicherEinstandskurswaehrung` is the purchase-price currency.
+  Foreign-currency and bond (non-STUECK) mappings are UNVERIFIED — the sample
+  depot holds only EUR funds.
 
 ## MoneyMoney Lua API gotchas (verified against moneymoney.app/api/webbanking)
 
@@ -84,6 +95,12 @@ URL. Observed on
 - Security table fields: WKN is `securityNumber`, exchange name is `market`,
   quantity currency is `currencyOfQuantity` (nil for share counts). Unknown
   fields are silently ignored — misspelled fields fail without any error.
+- `tradeTimestamp` (Notierungszeitpunkt, POSIX seconds) is a documented
+  securities field, but MoneyMoney's portfolio UI displays no quote-timestamp
+  anywhere — native (non-extension) depots show none either (checked
+  2026-07-08). Delivering it is correct; just don't expect visible output.
+  The docs also list `exchangeRateOfPrice`/`exchangeRateOfPurchasePrice` for
+  foreign-currency positions (unused so far).
 - The `poll = true` challenge flag used by InitializeSession2 is undocumented;
   MoneyMoney fixes the poll tick and offers no interval control. (A 2×-per-tick
   status check via `MM.sleep(1)` was tried 2026-07-08 and reverted the next
